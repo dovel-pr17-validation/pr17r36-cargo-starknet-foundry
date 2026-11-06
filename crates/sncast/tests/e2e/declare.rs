@@ -1,0 +1,1305 @@
+use crate::helpers::constants::{CONTRACTS_DIR, DEVNET_OZ_CLASS_HASH_CAIRO_0, URL};
+use crate::helpers::fixtures::{
+    copy_directory_to_tempdir, create_and_deploy_account, create_and_deploy_oz_account,
+    duplicate_contract_directory_with_salt, get_accounts_path, get_transaction_by_hash,
+    get_transaction_hash, get_transaction_receipt, join_tempdirs,
+};
+use crate::helpers::output::get_declared_class_hash_from_json_output;
+use crate::helpers::runner::runner;
+use configuration::CONFIG_FILENAME;
+use indoc::{formatdoc, indoc};
+use serde_json::json;
+use shared::test_utils::output_assert::{AsOutput, assert_stderr_contains, assert_stdout_contains};
+use sncast::AccountType;
+use sncast::helpers::constants::{BRAAVOS_CLASS_HASH, OZ_CLASS_HASH, READY_CLASS_HASH};
+use sncast::helpers::fee::FeeArgs;
+use starknet_rust::core::types::TransactionReceipt::Declare;
+use starknet_rust::core::types::contract::SierraClass;
+use starknet_rust::core::types::{DeclareTransaction, Transaction, TransactionExecutionStatus};
+use starknet_types_core::felt::{Felt, NonZeroFelt};
+use std::fs;
+use test_case::test_case;
+use wiremock::matchers::{method, path_regex};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[test_case(false; "with_abi")]
+#[test_case(true; "no_abi")]
+#[tokio::test]
+async fn test_happy_case_human_readable(no_abi: bool) {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        if no_abi {
+            "human_readable_no_abi"
+        } else {
+            "human_readable"
+        },
+    );
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let mut args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "Map",
+    ];
+    if no_abi {
+        args.push("--no-abi");
+    }
+
+    let snapbox = runner(&args)
+        .env("SNCAST_FORCE_SHOW_EXPLORER_LINKS", "1")
+        .current_dir(tempdir.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc! {r"
+        Success: Declaration completed
+
+        Class Hash:       0x[..]
+        Transaction Hash: 0x[..]
+
+        To see declaration details, visit:
+        class: https://[..]
+        transaction: https://[..]
+
+        To deploy a contract of this class, run:
+        sncast --accounts-file accounts.json --account my_account deploy --class-hash 0x[..] --url http://127.0.0.1:5055/rpc
+    " },
+    );
+}
+
+#[tokio::test]
+async fn test_happy_case_json_output() {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        "test_happy_case_json_output",
+    );
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let args = vec![
+        "--json",
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "Map",
+    ];
+
+    let snapbox = runner(&args)
+        .env("SNCAST_FORCE_SHOW_EXPLORER_LINKS", "1")
+        .current_dir(tempdir.path());
+
+    snapbox.assert().success().stdout_eq(indoc! {
+        r#"
+{"status":"compiling","message":"[..]"}
+{"type":"warn","message":"[..]"}
+{"type":"warn","message":"[..]"}
+{"status":"compiling","message":"[..]"}
+{"status":"finished","message":"[..]"}
+{"class_hash":"0x0[..]","command":"declare","transaction_hash":"0x0[..]","type":"response"}
+{"links":"class: https://sepolia.voyager.online/class/0x0[..]/ntransaction: https://sepolia.voyager.online/tx/0x0[..]/n","title":"declaration","type":"notification"}
+"#,
+    });
+}
+
+#[test_case(DEVNET_OZ_CLASS_HASH_CAIRO_0.parse().unwrap(), AccountType::OpenZeppelin; "cairo_0_class_hash"
+)]
+#[test_case(OZ_CLASS_HASH, AccountType::OpenZeppelin; "cairo_1_class_hash")]
+#[test_case(READY_CLASS_HASH, AccountType::Ready; "READY_CLASS_HASH")]
+#[test_case(BRAAVOS_CLASS_HASH, AccountType::Braavos; "braavos_class_hash")]
+#[tokio::test]
+async fn test_happy_case(class_hash: Felt, account_type: AccountType) {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        &class_hash.to_string(),
+    );
+    let tempdir = create_and_deploy_account(class_hash, account_type).await;
+    join_tempdirs(&contract_path, &tempdir);
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "--json",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "Map",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().success().get_output().stdout.clone();
+
+    let hash = get_transaction_hash(&output);
+    let receipt = get_transaction_receipt(hash).await;
+
+    assert!(matches!(receipt, Declare(_)));
+}
+
+#[tokio::test]
+async fn test_contract_with_constructor_params() {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/contract_with_constructor_params",
+        "put",
+        "human_readable",
+    );
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "ContractWithConstructorParams",
+    ];
+
+    let snapbox = runner(&args)
+        .env("SNCAST_FORCE_SHOW_EXPLORER_LINKS", "1")
+        .current_dir(tempdir.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc! {r"
+        Success: Declaration completed
+
+        Class Hash:       0x[..]
+        Transaction Hash: 0x[..]
+
+        To see declaration details, visit:
+        class: https://[..]
+        transaction: https://[..]
+
+        To deploy a contract of this class, replace the placeholders in `--arguments` with your actual values, then run:
+        sncast --accounts-file accounts.json --account my_account deploy --class-hash 0x[..] --arguments '<foo: felt252>, <bar: felt252>' --url http://127.0.0.1:5055/rpc
+    " },
+    );
+}
+
+#[tokio::test]
+async fn test_happy_case_with_full_module_path_contract_name() {
+    let contract_path =
+        copy_directory_to_tempdir(CONTRACTS_DIR.to_string() + "/duplicate_contract_name");
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "duplicate_contract_name::first_contract::HelloStarknet",
+    ];
+
+    let snapbox = runner(&args)
+        .env("SNCAST_FORCE_SHOW_EXPLORER_LINKS", "1")
+        .current_dir(tempdir.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc! {r"
+        Success: Declaration completed
+
+        Class Hash:       0x[..]
+        Transaction Hash: 0x[..]
+
+        To see declaration details, visit:
+        class: https://[..]
+        transaction: https://[..]
+    "},
+    );
+}
+
+#[tokio::test]
+async fn test_contract_with_constructor_params_no_abi() {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/contract_with_constructor_params",
+        "put",
+        "human_readable_no_abi",
+    );
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "ContractWithConstructorParams",
+        "--no-abi",
+    ];
+
+    let snapbox = runner(&args)
+        .env("SNCAST_FORCE_SHOW_EXPLORER_LINKS", "1")
+        .current_dir(tempdir.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc! {r"
+        Success: Declaration completed
+
+        Class Hash:       0x[..]
+        Transaction Hash: 0x[..]
+
+        To see declaration details, visit:
+        class: https://[..]
+        transaction: https://[..]
+
+        To deploy a contract of this class, replace the placeholders in `--constructor-calldata` with your actual values, then run:
+        sncast --accounts-file accounts.json --account my_account deploy --class-hash 0x[..] --constructor-calldata <serialized-constructor-args> --url http://127.0.0.1:5055/rpc
+
+        Hint: Constructor arguments must be pre-serialized. Use `sncast utils serialize --abi-file <path-to-abi> --function constructor --arguments '<foo: felt252>, <bar: felt252>'` and pass the returned felts to `--constructor-calldata`.
+    " },
+    );
+}
+
+#[tokio::test]
+async fn test_happy_case_no_abi() {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        "test_happy_case_no_abi",
+    );
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "--json",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "Map",
+        "--no-abi",
+    ];
+
+    let output = runner(&args)
+        .current_dir(tempdir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let declared_class_hash = get_declared_class_hash_from_json_output(&output);
+    let sierra_path = tempdir
+        .path()
+        .join("target/release/map_Map.contract_class.json");
+    let mut sierra_class: SierraClass = serde_json::from_str(
+        &fs::read_to_string(&sierra_path).expect("Failed to read sierra artifact"),
+    )
+    .expect("Failed to parse sierra artifact");
+
+    let original_class_hash = sierra_class
+        .class_hash()
+        .expect("Failed to compute class hash");
+    sierra_class.abi.clear();
+    let stripped_class_hash = sierra_class
+        .class_hash()
+        .expect("Failed to compute class hash without ABI");
+
+    assert_ne!(declared_class_hash, original_class_hash);
+    assert_eq!(declared_class_hash, stripped_class_hash);
+}
+
+#[test_case(FeeArgs{
+    max_fee: Some(NonZeroFelt::try_from(Felt::from(1_000_000_000_000_000_000_000_000_u128)).unwrap()),
+    l1_data_gas: None,
+    l1_data_gas_price:  None,
+    l1_gas:  None,
+    l1_gas_price:  None,
+    l2_gas:  None,
+    l2_gas_price:  None,
+    tip: Some(100_000),
+    estimate_tip: false,
+}; "max_fee")]
+#[test_case(FeeArgs{
+    max_fee: None,
+    l1_data_gas: Some(100_000),
+    l1_data_gas_price: Some(10_000_000_000_000),
+    l1_gas: Some(100_000),
+    l1_gas_price: Some(10_000_000_000_000),
+    l2_gas: Some(1_000_000_000),
+    l2_gas_price: Some(100_000_000_000_000_000_000),
+    tip: None,
+    estimate_tip: false,
+}; "resource_bounds")]
+#[tokio::test]
+async fn test_happy_case_different_fees(fee_args: FeeArgs) {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        &format!(
+            "{}{}{}{}{}{}{}",
+            fee_args.max_fee.map_or(Felt::from(0), Felt::from),
+            fee_args.l1_data_gas.unwrap_or(1),
+            fee_args.l1_data_gas_price.unwrap_or(2),
+            fee_args.l1_gas.unwrap_or(3),
+            fee_args.l1_gas_price.unwrap_or(4),
+            fee_args.l2_gas.unwrap_or(5),
+            fee_args.l2_gas_price.unwrap_or(6)
+        ),
+    );
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+    let mut args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "--json",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "Map",
+    ];
+
+    let options = [
+        (
+            "--max-fee",
+            fee_args.max_fee.map(Felt::from).map(|x| x.to_string()),
+        ),
+        ("--l1-data-gas", fee_args.l1_data_gas.map(|x| x.to_string())),
+        (
+            "--l1-data-gas-price",
+            fee_args.l1_data_gas_price.map(|x| x.to_string()),
+        ),
+        ("--l1-gas", fee_args.l1_gas.map(|x| x.to_string())),
+        (
+            "--l1-gas-price",
+            fee_args.l1_gas_price.map(|x| x.to_string()),
+        ),
+        ("--l2-gas", fee_args.l2_gas.map(|x| x.to_string())),
+        (
+            "--l2-gas-price",
+            fee_args.l2_gas_price.map(|x| x.to_string()),
+        ),
+        ("--tip", fee_args.tip.map(|x| x.to_string())),
+    ];
+
+    for &(key, ref value) in &options {
+        if let Some(val) = value.as_ref() {
+            args.push(key);
+            args.push(val);
+        }
+    }
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().success().get_output().stdout.clone();
+
+    let hash = get_transaction_hash(&output);
+    let Declare(receipt) = get_transaction_receipt(hash).await else {
+        panic!("Should be Declare receipt");
+    };
+    assert_eq!(
+        receipt.execution_result.status(),
+        TransactionExecutionStatus::Succeeded
+    );
+
+    let Transaction::Declare(DeclareTransaction::V3(tx)) = get_transaction_by_hash(hash).await
+    else {
+        panic!("Expected Declare V3 transaction")
+    };
+    assert_eq!(tx.tip, fee_args.tip.unwrap_or(0));
+}
+
+#[tokio::test]
+async fn test_happy_case_specify_package() {
+    let tempdir = copy_directory_to_tempdir(CONTRACTS_DIR.to_string() + "/multiple_packages");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user8",
+        "--json",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "supercomplexcode",
+        "--package",
+        "main_workspace",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+
+    let output = snapbox.assert().success().get_output().stdout.clone();
+
+    let hash = get_transaction_hash(&output);
+    let receipt = get_transaction_receipt(hash).await;
+
+    assert!(matches!(receipt, Declare(_)));
+}
+
+#[tokio::test]
+async fn test_contract_already_declared() {
+    let tempdir = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        "8512851",
+    );
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "Map",
+    ];
+
+    runner(&args).current_dir(tempdir.path()).assert().success();
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Command: declare
+        Error: Contract with class hash 0x0[..] is already declared
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_contract_already_declared_estimate_fee() {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        "74362345",
+    );
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "Map",
+    ];
+    // Commented out because we explicitly do not want to set any resource bounds.
+    // Transaction has to go through estimate fee endpoint first because it throws different errors
+    // than the normal declare endpoint and we want to test them.
+
+    runner(&args).current_dir(tempdir.path()).assert().success();
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Command: declare
+        Error: Contract with class hash 0x0[..] is already declared
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_invalid_nonce() {
+    let contract_path =
+        duplicate_contract_directory_with_salt(CONTRACTS_DIR.to_string() + "/map", "put", "1123");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user8",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "Map",
+        "--nonce",
+        "12345",
+    ];
+
+    let snapbox = runner(&args).current_dir(contract_path.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r#"
+        Command: declare
+        Error: Transaction execution error = TransactionExecutionErrorData { transaction_index: 0, execution_error: Message("Account transaction nonce is invalid.") }
+        "#},
+    );
+}
+
+#[tokio::test]
+async fn test_wrong_contract_name_passed() {
+    let tempdir = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        "521754725",
+    );
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "nonexistent",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().failure();
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Command: declare
+        Error: Failed to find nonexistent artifact in starknet_artifacts.json file[..]
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_errors_on_ambiguous_contract_name() {
+    let contract_path =
+        copy_directory_to_tempdir(CONTRACTS_DIR.to_string() + "/duplicate_contract_name");
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "HelloStarknet",
+    ];
+
+    let output = runner(&args).current_dir(tempdir.path()).assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r#"
+        Command: declare
+        Error: Found more than one contract matching "HelloStarknet". Pass one of these module paths to `--contract-name`:
+         - duplicate_contract_name::first_contract::HelloStarknet
+         - duplicate_contract_name::second_contract::HelloStarknet
+        "#},
+    );
+}
+
+#[test]
+fn test_scarb_build_fails_when_wrong_cairo_path() {
+    let tempdir = copy_directory_to_tempdir(CONTRACTS_DIR.to_string() + "/build_fails");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "BuildFails",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().failure();
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+            Command: declare
+            Error: Failed to build contract
+
+            Caused by:
+                Failed to build using scarb; `scarb` exited with error
+        "},
+    );
+}
+
+#[test]
+fn test_scarb_build_fails_when_wrong_cairo_path_json() {
+    let tempdir = copy_directory_to_tempdir(CONTRACTS_DIR.to_string() + "/build_fails");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--json",
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "BuildFails",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().failure();
+    assert_stderr_contains(
+        output,
+        r#"{"command":"declare","error":"Failed to build contract: Failed to build using scarb; `scarb` exited with error","type":"error"}"#,
+    );
+}
+
+#[should_panic(expected = "Path to Scarb.toml manifest does not exist")]
+#[test]
+fn test_scarb_build_fails_scarb_toml_does_not_exist() {
+    let tempdir = copy_directory_to_tempdir(CONTRACTS_DIR);
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "BuildFails",
+    ];
+
+    runner(&args).current_dir(tempdir.path()).assert().success();
+}
+
+#[test]
+fn test_scarb_build_fails_manifest_does_not_exist() {
+    let tempdir = copy_directory_to_tempdir(CONTRACTS_DIR);
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "BuildFails",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Error: Path to Scarb.toml manifest does not exist =[..]
+        "},
+    );
+}
+
+#[test]
+fn test_too_low_gas() {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        "2451825",
+    );
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user6",
+        "--wait",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "Map",
+        "--l1-gas",
+        "1",
+        "--l2-gas",
+        "1",
+        "--l1-data-gas",
+        "1",
+    ];
+
+    let snapbox = runner(&args).current_dir(contract_path.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Command: declare
+        Error: The transaction's resources don't cover validation or the minimal transaction fee
+        "},
+    );
+}
+
+#[should_panic(expected = "Make sure you have enabled sierra code generation in Scarb.toml")]
+#[test]
+fn test_scarb_no_sierra_artifact() {
+    let tempdir = copy_directory_to_tempdir(CONTRACTS_DIR.to_string() + "/no_sierra");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "minimal_contract",
+    ];
+
+    runner(&args).current_dir(tempdir.path()).assert().success();
+}
+
+#[test]
+fn test_scarb_no_casm_artifact() {
+    let tempdir = copy_directory_to_tempdir(CONTRACTS_DIR.to_string() + "/no_casm");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "minimal_contract",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc! {r"
+        Success: Declaration completed
+
+        Class Hash: [..]
+        Transaction Hash: [..]
+
+        To deploy a contract of this class, run:
+        sncast --accounts-file [..]accounts.json --account user1 deploy --class-hash 0x[..] --url http://127.0.0.1:5055/rpc
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_many_packages_default_json() {
+    let tempdir = copy_directory_to_tempdir(CONTRACTS_DIR.to_string() + "/multiple_packages");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user8",
+        "--json",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "supercomplexcode2",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        r#"{"command":"declare","error":"More than one package found in scarb metadata - specify package using --package flag","type":"error"}"#,
+    );
+}
+
+#[tokio::test]
+async fn test_workspaces_package_specified_virtual_fibonacci_json() {
+    let tempdir = copy_directory_to_tempdir(CONTRACTS_DIR.to_string() + "/virtual_workspace");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user8",
+        "--json",
+        "declare",
+        "--url",
+        URL,
+        "--package",
+        "cast_fibonacci",
+        "--contract-name",
+        "FibonacciContract",
+    ];
+
+    let snapbox = runner(&args)
+        .env("SNCAST_FORCE_SHOW_EXPLORER_LINKS", "1")
+        .current_dir(tempdir.path());
+
+    let output = snapbox.assert().success().get_output().clone();
+    let output = output.stdout.clone();
+    let hash = get_transaction_hash(&output);
+    let receipt = get_transaction_receipt(hash).await;
+    assert!(matches!(receipt, Declare(_)));
+}
+
+#[tokio::test]
+async fn test_workspaces_package_no_contract() {
+    let tempdir = copy_directory_to_tempdir(CONTRACTS_DIR.to_string() + "/virtual_workspace");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user8",
+        "declare",
+        "--url",
+        URL,
+        "--package",
+        "cast_addition",
+        "--contract-name",
+        "whatever",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Command: declare
+        Error: Failed to find whatever artifact in starknet_artifacts.json file[..]
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_non_existent_profile() {
+    let contract_path =
+        duplicate_contract_directory_with_salt(CONTRACTS_DIR.to_string() + "/map", "put", "694215");
+    fs::copy(
+        "tests/data/files/snfoundry_correct.toml",
+        contract_path.path().join(CONFIG_FILENAME),
+    )
+    .expect("Failed to copy config file to temp dir");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--profile",
+        "profile5",
+        "--scarb-profile",
+        "nonexistent_profile",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "Map",
+    ];
+
+    let snapbox = runner(&args)
+        .env("SNCAST_FORCE_SHOW_EXPLORER_LINKS", "1")
+        .current_dir(contract_path.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc! {"
+            [..]
+            [WARNING] Profile nonexistent_profile does not exist in scarb, using 'release' profile.
+            Success: Declaration completed
+
+            Class Hash:       [..]
+            Transaction Hash: [..]
+
+            To see declaration details, visit:
+            class: [..]
+            transaction: [..]
+
+            To deploy a contract of this class, run:
+            sncast --accounts-file [..]accounts.json --account user8 deploy --class-hash 0x[..] --url http://127.0.0.1:5055/rpc
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_no_explorer_links_on_localhost() {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        "localhost_test",
+    );
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "declare",
+        "--url",
+        "http://localhost:5055/rpc",
+        "--contract-name",
+        "Map",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().success();
+
+    assert!(
+        !output
+            .as_stdout()
+            .contains("To see declaration details, visit:")
+    );
+}
+
+#[tokio::test]
+async fn test_dry_run() {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        "human_readable",
+    );
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "Map",
+        "--dry-run",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc! {
+            "
+            Success: Dry run completed
+
+            Overall Fee: [..] Fri (~[..] STRK)
+            "
+        },
+    );
+}
+
+#[tokio::test]
+async fn test_dry_run_detailed() {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        "human_readable",
+    );
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "Map",
+        "--dry-run",
+        "--detailed",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc! {
+            "
+            Success: Dry run completed
+
+            Overall Fee: [..] Fri (~[..] STRK)
+            L1 Gas Consumed:      [..]
+            L1 Gas Price:         [..]
+            L2 Gas Consumed:      [..]
+            L2 Gas Price:         [..]
+            L1 Data Gas Consumed: [..]
+            L1 Data Gas Price:    [..]
+            "
+        },
+    );
+}
+
+async fn mock_voyager_verification(
+    status: u16,
+    body: serde_json::Value,
+    expected_calls: u64,
+) -> MockServer {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/?class-verify/0x[0-9a-f]+$"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        .expect(expected_calls)
+        .mount(&mock_server)
+        .await;
+    mock_server
+}
+
+async fn mock_starkloupe_verification(
+    status: u16,
+    body: serde_json::Value,
+    expected_calls: u64,
+) -> MockServer {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/?v1/sn_sepolia/verify$"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        .expect(expected_calls)
+        .mount(&mock_server)
+        .await;
+    mock_server
+}
+
+fn declare_with_verification_args<'a>(
+    verifier: &'a str,
+    extra: &[&'a str],
+    json: bool,
+) -> Vec<&'a str> {
+    let mut args = vec![];
+    if json {
+        args.push("--json");
+    }
+    args.extend([
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "declare",
+        "--url",
+        URL,
+        "--contract-name",
+        "Map",
+        "--verifier",
+        verifier,
+        "--confirm-verification",
+    ]);
+    args.extend(extra);
+    args
+}
+
+#[test_case("voyager")]
+#[test_case("starkloupe")]
+#[tokio::test]
+async fn test_happy_case_with_verification(verifier: &str) {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        &format!("test_happy_case_with_verification_{verifier}"),
+    );
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let job_id = "2b206064-ffee-4955-8a86-1ff3b854416a";
+    let mock_server = match verifier {
+        "voyager" => mock_voyager_verification(200, json!({ "job_id": job_id }), 1).await,
+        "starkloupe" => mock_starkloupe_verification(200, json!({ "job_id": job_id }), 1).await,
+        _ => unreachable!("unsupported verifier: {verifier}"),
+    };
+
+    let args = declare_with_verification_args(verifier, &[], false);
+    let output = runner(&args)
+        .env("VERIFIER_API_URL", mock_server.uri())
+        .current_dir(tempdir.path())
+        .assert()
+        .success();
+
+    let expected_verification_message = match verifier {
+        "voyager" => format!(
+            "Map submitted for verification, you can query the status at: {}/class-verify/job/{job_id}",
+            mock_server.uri()
+        ),
+        "starkloupe" => json!({ "job_id": job_id }).to_string(),
+        _ => unreachable!("unsupported verifier: {verifier}"),
+    };
+    assert_stdout_contains(
+        output,
+        formatdoc! {r"
+        Success: Declaration completed
+
+        Class Hash:       0x[..]
+        Transaction Hash: 0x[..]
+
+        {expected_verification_message}
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_happy_case_with_verification_json_output() {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        "test_happy_case_with_verification_json_output",
+    );
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let job_id = "2b206064-ffee-4955-8a86-1ff3b854416a";
+    let mock_server = mock_voyager_verification(200, json!({ "job_id": job_id }), 1).await;
+
+    let args = declare_with_verification_args("voyager", &[], true);
+    let output = runner(&args)
+        .env("VERIFIER_API_URL", mock_server.uri())
+        .current_dir(tempdir.path())
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let response: serde_json::Value = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|v| v["type"] == "response")
+        .expect("No response found in output");
+
+    assert_eq!(response["command"], "declare");
+    assert!(response["class_hash"].as_str().unwrap().starts_with("0x"));
+    assert!(
+        response["verification_message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("class-verify/job/{job_id}"))
+    );
+}
+
+#[tokio::test]
+async fn test_verification_not_started_when_declaration_fails() {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        "test_verification_not_started_when_declaration_fails",
+    );
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    // Verifier must not be called at all; `MockServer` checks `expect(0)` on drop
+    let mock_server = mock_voyager_verification(200, json!({ "job_id": "unused" }), 0).await;
+
+    let args = declare_with_verification_args("voyager", &["--nonce", "12345"], false);
+    let output = runner(&args)
+        .env("VERIFIER_API_URL", mock_server.uri())
+        .current_dir(tempdir.path())
+        .assert()
+        .failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Command: declare
+        Error: Transaction execution error = [..]Account transaction nonce is invalid.[..]
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_dry_run_forbidden_with_verification() {
+    let args = declare_with_verification_args("voyager", &["--dry-run"], false);
+    let output = runner(&args).assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        error: the argument '--dry-run' cannot be used with:
+          --verifier <VERIFIER>
+          --test-files
+          --confirm-verification
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_verification_fails() {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        "test_verification_fails",
+    );
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let mock_server =
+        mock_voyager_verification(400, json!({ "error": "Verification failed" }), 1).await;
+
+    let args = declare_with_verification_args("voyager", &[], false);
+    let output = runner(&args)
+        .env("VERIFIER_API_URL", mock_server.uri())
+        .current_dir(tempdir.path())
+        .assert()
+        .success();
+
+    assert_stdout_contains(
+        output.as_stdout().to_string(),
+        "Success: Declaration completed",
+    );
+    assert_stderr_contains(
+        output.as_stderr().to_string(),
+        "Failed to verify the contract: Verification failed",
+    );
+}

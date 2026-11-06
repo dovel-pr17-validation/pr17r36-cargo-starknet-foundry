@@ -1,0 +1,785 @@
+use crate::helpers::constants::{
+    ACCOUNT, ACCOUNT_FILE_PATH, DATA_TRANSFORMER_CONTRACT_ADDRESS_SEPOLIA,
+    DEVNET_OZ_CLASS_HASH_CAIRO_0, MAP_CONTRACT_ADDRESS_SEPOLIA, URL,
+};
+use crate::helpers::fixtures::{
+    create_and_deploy_account, create_and_deploy_oz_account, get_transaction_by_hash,
+    get_transaction_hash, get_transaction_receipt, join_tempdirs,
+};
+use crate::helpers::runner::{runner, sncast_test_bin_path};
+use crate::helpers::shell::os_specific_shell;
+use camino::Utf8PathBuf;
+use configuration::test_utils::copy_config_to_tempdir;
+use indoc::indoc;
+use shared::test_utils::output_assert::{assert_stderr_contains, assert_stdout_contains};
+use sncast::AccountType;
+use sncast::helpers::constants::{BRAAVOS_CLASS_HASH, OZ_CLASS_HASH, READY_CLASS_HASH};
+use sncast::helpers::fee::FeeArgs;
+use starknet_rust::core::types::TransactionReceipt::Invoke;
+use starknet_rust::core::types::{InvokeTransaction, Transaction, TransactionExecutionStatus};
+use starknet_types_core::felt::{Felt, NonZeroFelt};
+use tempfile::tempdir;
+use test_case::test_case;
+
+#[tokio::test]
+async fn test_happy_case_human_readable() {
+    let tempdir = create_and_deploy_account(OZ_CLASS_HASH, AccountType::OpenZeppelin).await;
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "invoke",
+        "--url",
+        URL,
+        "--contract-address",
+        MAP_CONTRACT_ADDRESS_SEPOLIA,
+        "--function",
+        "put",
+        "--calldata",
+        "0x1 0x2",
+    ];
+
+    let snapbox = runner(&args)
+        .env("SNCAST_FORCE_SHOW_EXPLORER_LINKS", "1")
+        .current_dir(tempdir.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc! {
+            "
+            Success: Invoke completed
+
+            Transaction Hash: 0x0[..]
+
+            To see invocation details, visit:
+            transaction: [..]
+            "
+        },
+    );
+}
+
+#[test_case(DEVNET_OZ_CLASS_HASH_CAIRO_0.parse().unwrap(), AccountType::OpenZeppelin; "cairo_0_class_hash")]
+#[test_case(OZ_CLASS_HASH, AccountType::OpenZeppelin; "cairo_1_class_hash")]
+#[test_case(READY_CLASS_HASH, AccountType::Ready; "READY_CLASS_HASH")]
+#[test_case(BRAAVOS_CLASS_HASH, AccountType::Braavos; "braavos_class_hash")]
+#[tokio::test]
+async fn test_happy_case(class_hash: Felt, account_type: AccountType) {
+    let tempdir = create_and_deploy_account(class_hash, account_type).await;
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "--json",
+        "invoke",
+        "--url",
+        URL,
+        "--contract-address",
+        MAP_CONTRACT_ADDRESS_SEPOLIA,
+        "--function",
+        "put",
+        "--calldata",
+        "0x1 0x2",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().success();
+    let stdout = output.get_output().stdout.clone();
+
+    let hash = get_transaction_hash(&stdout);
+    let receipt = get_transaction_receipt(hash).await;
+
+    assert!(matches!(receipt, Invoke(_)));
+}
+
+#[tokio::test]
+async fn test_invoke_with_alias() {
+    let account_dir = create_and_deploy_oz_account().await;
+    let config_dir = copy_config_to_tempdir("tests/data/files/snfoundry_aliases.toml", None);
+    join_tempdirs(&account_dir, &config_dir);
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "invoke",
+        "--contract-address",
+        "@map",
+        "--function",
+        "put",
+        "--calldata",
+        "0x1 0x2",
+    ];
+
+    let output = runner(&args)
+        .current_dir(config_dir.path())
+        .assert()
+        .success();
+
+    assert_stdout_contains(output, "Success: Invoke completed");
+}
+
+#[tokio::test]
+async fn test_invoke_with_calldata_alias() {
+    let account_dir = create_and_deploy_oz_account().await;
+    let config_dir = copy_config_to_tempdir("tests/data/files/snfoundry_aliases.toml", None);
+    join_tempdirs(&account_dir, &config_dir);
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "invoke",
+        "--contract-address",
+        "@map",
+        "--function",
+        "put",
+        "--calldata",
+        "0x1 @deployer-123",
+    ];
+
+    let output = runner(&args)
+        .current_dir(config_dir.path())
+        .assert()
+        .success();
+
+    assert_stdout_contains(output, "Success: Invoke completed");
+}
+
+#[tokio::test]
+async fn test_invoke_with_unknown_alias_in_calldata() {
+    let account_dir = create_and_deploy_oz_account().await;
+    let config_dir = copy_config_to_tempdir("tests/data/files/snfoundry_aliases.toml", None);
+    join_tempdirs(&account_dir, &config_dir);
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "invoke",
+        "--contract-address",
+        "@map",
+        "--function",
+        "put",
+        "--calldata",
+        "0x1 @unknown",
+    ];
+
+    let output = runner(&args)
+        .current_dir(config_dir.path())
+        .assert()
+        .failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+            Command: invoke
+            Error: Alias `unknown` not found in config
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_invoke_with_unknown_alias() {
+    let account_dir = create_and_deploy_oz_account().await;
+    let config_dir = copy_config_to_tempdir("tests/data/files/snfoundry_aliases.toml", None);
+    join_tempdirs(&account_dir, &config_dir);
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "invoke",
+        "--contract-address",
+        "@unknown",
+        "--function",
+        "put",
+        "--calldata",
+        "0x1 0x2",
+    ];
+
+    let output = runner(&args)
+        .current_dir(config_dir.path())
+        .assert()
+        .failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+            Command: invoke
+            Error: Invalid contract address
+
+            Caused by:
+                Alias `unknown` not found in config
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_happy_case_with_legacy_argent_account_type() {
+    // Verifies backward compatibility: an account file with "type": "argent" (created before the
+    // --argent option was removed) can still be used to sign and send transactions.
+    let tempdir = create_and_deploy_account(READY_CLASS_HASH, AccountType::Ready).await;
+    let accounts_file = "accounts.json";
+
+    // Simulate an old account file by replacing "ready" with "argent"
+    let path = tempdir.path().join(accounts_file);
+    let contents = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, contents.replace("\"ready\"", "\"argent\"")).unwrap();
+
+    let args = vec![
+        "--accounts-file",
+        accounts_file,
+        "--account",
+        "my_account",
+        "--json",
+        "invoke",
+        "--url",
+        URL,
+        "--contract-address",
+        MAP_CONTRACT_ADDRESS_SEPOLIA,
+        "--function",
+        "put",
+        "--calldata",
+        "0x1 0x2",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().success();
+    let stdout = &output.get_output().stdout;
+
+    let hash = get_transaction_hash(stdout);
+    let receipt = get_transaction_receipt(hash).await;
+
+    assert!(matches!(receipt, Invoke(_)));
+}
+
+#[test_case(FeeArgs{
+    max_fee: Some(NonZeroFelt::try_from(Felt::from(1_000_000_000_000_000_000_000_000_u128)).unwrap()),
+    l1_data_gas: None,
+    l1_data_gas_price:  None,
+    l1_gas:  None,
+    l1_gas_price:  None,
+    l2_gas:  None,
+    l2_gas_price:  None,
+    tip: None,
+    estimate_tip: false,
+}; "max_fee")]
+#[test_case(FeeArgs{
+    max_fee: None,
+    l1_data_gas: Some(100_000),
+    l1_data_gas_price: Some(10_000_000_000_000),
+    l1_gas: Some(100_000),
+    l1_gas_price: Some(10_000_000_000_000),
+    l2_gas: Some(1_000_000_000),
+    l2_gas_price: Some(100_000_000_000_000_000_000),
+    tip: Some(100_000_000),
+    estimate_tip: false,
+}; "resource_bounds")]
+#[tokio::test]
+async fn test_happy_case_different_fees(fee_args: FeeArgs) {
+    let tempdir = create_and_deploy_oz_account().await;
+    let mut args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "--json",
+        "invoke",
+        "--url",
+        URL,
+        "--contract-address",
+        MAP_CONTRACT_ADDRESS_SEPOLIA,
+        "--function",
+        "put",
+        "--calldata",
+        "0x1 0x2",
+    ];
+    let options = [
+        (
+            "--max-fee",
+            fee_args.max_fee.map(Felt::from).map(|x| x.to_string()),
+        ),
+        ("--l1-data-gas", fee_args.l1_data_gas.map(|x| x.to_string())),
+        (
+            "--l1-data-gas-price",
+            fee_args.l1_data_gas_price.map(|x| x.to_string()),
+        ),
+        ("--l1-gas", fee_args.l1_gas.map(|x| x.to_string())),
+        (
+            "--l1-gas-price",
+            fee_args.l1_gas_price.map(|x| x.to_string()),
+        ),
+        ("--l2-gas", fee_args.l2_gas.map(|x| x.to_string())),
+        (
+            "--l2-gas-price",
+            fee_args.l2_gas_price.map(|x| x.to_string()),
+        ),
+        ("--tip", fee_args.tip.map(|x| x.to_string())),
+    ];
+
+    for &(key, ref value) in &options {
+        if let Some(val) = value.as_ref() {
+            args.push(key);
+            args.push(val);
+        }
+    }
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().success().get_output().stdout.clone();
+
+    let hash = get_transaction_hash(&output);
+    let Invoke(receipt) = get_transaction_receipt(hash).await else {
+        panic!("Should be Invoke receipt");
+    };
+    assert_eq!(
+        receipt.execution_result.status(),
+        TransactionExecutionStatus::Succeeded
+    );
+
+    let Transaction::Invoke(InvokeTransaction::V3(tx)) = get_transaction_by_hash(hash).await else {
+        panic!("Expected Invoke V3 transaction")
+    };
+    assert_eq!(tx.tip, fee_args.tip.unwrap_or(0));
+}
+
+#[tokio::test]
+async fn test_max_fee_lower_than_estimated_fee_displays_error() {
+    let tempdir = create_and_deploy_oz_account().await;
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "invoke",
+        "--url",
+        URL,
+        "--contract-address",
+        MAP_CONTRACT_ADDRESS_SEPOLIA,
+        "--function",
+        "put",
+        "--calldata",
+        "0x1 0x2",
+        "--max-fee",
+        "1",
+    ];
+
+    let output = runner(&args).current_dir(tempdir.path()).assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+            Command: invoke
+            Error: Estimated fee ([..]) is higher than provided max fee ([..])
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_contract_does_not_exist() {
+    let args = vec![
+        "--accounts-file",
+        ACCOUNT_FILE_PATH,
+        "--account",
+        ACCOUNT,
+        "invoke",
+        "--url",
+        URL,
+        "--contract-address",
+        "0x1",
+        "--function",
+        "put",
+    ];
+
+    let snapbox = runner(&args);
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        "Error: An error occurred in the called contract[..]Requested contract address[..]is not deployed[..]",
+    );
+}
+
+#[tokio::test]
+async fn test_contract_does_not_exist_with_calldata() {
+    let args = vec![
+        "--accounts-file",
+        ACCOUNT_FILE_PATH,
+        "--account",
+        ACCOUNT,
+        "invoke",
+        "--url",
+        URL,
+        "--contract-address",
+        "0x1",
+        "--function",
+        "put",
+        "--calldata",
+        "0x1 0x2",
+    ];
+
+    let snapbox = runner(&args);
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        "Error: An error occurred in the called contract[..]Requested contract address[..]is not deployed[..]",
+    );
+}
+
+#[test]
+fn test_wrong_function_name() {
+    let args = vec![
+        "--accounts-file",
+        ACCOUNT_FILE_PATH,
+        "--account",
+        "user2",
+        "invoke",
+        "--url",
+        URL,
+        "--contract-address",
+        MAP_CONTRACT_ADDRESS_SEPOLIA,
+        "--function",
+        "nonexistent_put",
+    ];
+
+    let snapbox = runner(&args);
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        r#"Error: Function with selector "0x2e0f845a8d0319c5c37d558023299beec2a0155d415f41cca140a09e6877c67" not found in ABI of the contract"#,
+    );
+}
+
+#[test]
+fn test_wrong_calldata() {
+    let args = vec![
+        "--accounts-file",
+        ACCOUNT_FILE_PATH,
+        "--account",
+        "user5",
+        "invoke",
+        "--url",
+        URL,
+        "--contract-address",
+        MAP_CONTRACT_ADDRESS_SEPOLIA,
+        "--function",
+        "put",
+        "--calldata",
+        "0x1",
+    ];
+
+    let snapbox = runner(&args);
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Command: invoke
+        Error: Transaction execution error [..]Failed to deserialize param #2[..]
+        "},
+    );
+}
+
+#[test]
+fn test_too_low_gas() {
+    let args = vec![
+        "--accounts-file",
+        ACCOUNT_FILE_PATH,
+        "--account",
+        "user11",
+        "--wait",
+        "invoke",
+        "--url",
+        URL,
+        "--contract-address",
+        MAP_CONTRACT_ADDRESS_SEPOLIA,
+        "--function",
+        "put",
+        "--calldata",
+        "0x1",
+        "0x2",
+        "--l1-gas",
+        "1",
+        "--l1-gas-price",
+        "1",
+        "--l2-gas",
+        "1",
+        "--l2-gas-price",
+        "1",
+        "--l1-data-gas",
+        "1",
+        "--l1-data-gas-price",
+        "1",
+    ];
+
+    let snapbox = runner(&args);
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Command: invoke
+        Error: The transaction's resources don't cover validation or the minimal transaction fee
+        "},
+    );
+}
+
+#[test]
+fn test_insufficient_account_balance() {
+    let args = vec![
+        "--accounts-file",
+        ACCOUNT_FILE_PATH,
+        "--account",
+        "user11",
+        "invoke",
+        "--url",
+        URL,
+        "--contract-address",
+        MAP_CONTRACT_ADDRESS_SEPOLIA,
+        "--function",
+        "put",
+        "--calldata",
+        "0x1",
+        "0x2",
+        "--l1-gas",
+        "100000",
+        "--l1-gas-price",
+        "1000000000000",
+        "--l2-gas",
+        "450000000",
+        "--l2-gas-price",
+        "100000000000000000000000",
+        "--l1-data-gas",
+        "100000",
+        "--l1-data-gas-price",
+        "1000000000000",
+    ];
+
+    let snapbox = runner(&args);
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Command: invoke
+        Error: Account 0x04ce45bd95d2ec35e3dd4490e28f896367958b966673789fef253626133ed37d balance is too small to cover transaction fee
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_happy_case_cairo_expression_calldata() {
+    let tempdir = create_and_deploy_oz_account().await;
+
+    let calldata = r"NestedStructWithField { a: SimpleStruct { a: 0x24 }, b: 96 }";
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "--json",
+        "invoke",
+        "--url",
+        URL,
+        "--contract-address",
+        DATA_TRANSFORMER_CONTRACT_ADDRESS_SEPOLIA,
+        "--function",
+        "nested_struct_fn",
+        "--arguments",
+        calldata,
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().success().get_output().stdout.clone();
+
+    let hash = get_transaction_hash(&output);
+    let receipt = get_transaction_receipt(hash).await;
+
+    assert!(matches!(receipt, Invoke(_)));
+}
+
+#[tokio::test]
+async fn test_happy_case_shell() {
+    let tempdir = create_and_deploy_oz_account().await;
+    let binary_path = sncast_test_bin_path();
+    let command = os_specific_shell(&Utf8PathBuf::from("tests/shell/invoke"));
+
+    let snapbox = command
+        .current_dir(tempdir.path())
+        .arg(binary_path)
+        .arg(URL)
+        .arg(DATA_TRANSFORMER_CONTRACT_ADDRESS_SEPOLIA);
+    snapbox.assert().success();
+}
+
+#[tokio::test]
+async fn test_dry_run() {
+    let tempdir = create_and_deploy_account(OZ_CLASS_HASH, AccountType::OpenZeppelin).await;
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "invoke",
+        "--url",
+        URL,
+        "--contract-address",
+        MAP_CONTRACT_ADDRESS_SEPOLIA,
+        "--function",
+        "put",
+        "--calldata",
+        "0x1 0x2",
+        "--dry-run",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc! {
+            "
+            Success: Dry run completed
+
+            Overall Fee: [..] Fri (~[..] STRK)
+            "
+        },
+    );
+}
+
+#[tokio::test]
+async fn test_dry_run_detailed() {
+    let tempdir = create_and_deploy_account(OZ_CLASS_HASH, AccountType::OpenZeppelin).await;
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "invoke",
+        "--url",
+        URL,
+        "--contract-address",
+        MAP_CONTRACT_ADDRESS_SEPOLIA,
+        "--function",
+        "put",
+        "--calldata",
+        "0x1 0x2",
+        "--dry-run",
+        "--detailed",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc! {
+            "
+            Success: Dry run completed
+
+            Overall Fee: [..] Fri (~[..] STRK)
+            L1 Gas Consumed:      [..]
+            L1 Gas Price:         [..]
+            L2 Gas Consumed:      [..]
+            L2 Gas Price:         [..]
+            L1 Data Gas Consumed: [..]
+            L1 Data Gas Price:    [..]
+            "
+        },
+    );
+}
+
+#[tokio::test]
+async fn test_dry_run_json_output() {
+    let tempdir = create_and_deploy_account(OZ_CLASS_HASH, AccountType::OpenZeppelin).await;
+
+    let args = vec![
+        "--json",
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "invoke",
+        "--url",
+        URL,
+        "--contract-address",
+        MAP_CONTRACT_ADDRESS_SEPOLIA,
+        "--function",
+        "put",
+        "--calldata",
+        "0x1 0x2",
+        "--dry-run",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert!(json.get("overall_fee").is_some());
+    assert!(json.get("l1_gas_consumed").is_some());
+    assert!(json.get("l1_gas_price").is_some());
+    assert!(json.get("l2_gas_consumed").is_some());
+    assert!(json.get("l2_gas_price").is_some());
+    assert!(json.get("l1_data_gas_consumed").is_some());
+    assert!(json.get("l1_data_gas_price").is_some());
+    // The `detailed` rendering flag must not appear in JSON.
+    assert!(json.get("detailed").is_none());
+}
+
+#[tokio::test]
+async fn test_dry_run_args_conflict_with_fee_args() {
+    let tempdir = tempdir().expect("Unable to create a temporary directory");
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "invoke",
+        "--url",
+        URL,
+        "--contract-address",
+        MAP_CONTRACT_ADDRESS_SEPOLIA,
+        "--function",
+        "put",
+        "--calldata",
+        "0x1 0x2",
+        "--dry-run",
+        "--max-fee",
+        "1000000000000000000",
+    ];
+
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {
+            "
+            error: the argument '--dry-run' cannot be used with:
+              --max-fee <MAX_FEE>
+              --l1-gas <L1_GAS>
+              --l1-gas-price <L1_GAS_PRICE>
+              --l2-gas <L2_GAS>
+              --l2-gas-price <L2_GAS_PRICE>
+              --l1-data-gas <L1_DATA_GAS>
+              --l1-data-gas-price <L1_DATA_GAS_PRICE>
+              --tip <TIP>
+              --estimate-tip
+            "
+        },
+    );
+}

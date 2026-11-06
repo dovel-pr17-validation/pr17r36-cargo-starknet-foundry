@@ -1,0 +1,216 @@
+# The Manifest Format
+
+The `snfoundry.toml` contains the project's manifest and allows specifying sncast settings.
+You can configure sncast settings and arguments instead of providing them in the CLI along with the commands.
+If `snfoundry.toml` is not found in the root directory, sncast will look for it in all parent directories. 
+If it is not found, default values will be used.
+
+## `snfoundry.toml` Contents
+
+### `[sncast.<profile-name>]`
+
+
+```toml
+[sncast.myprofile]
+# ...
+```
+
+All fields are optional and do not have to be provided. In case a field is not defined in a manifest file, it must be provided in CLI when executing a relevant `sncast` command.
+Profiles allow you to define different sets of configurations for various environments or use cases. For more details, see the [profiles explanation](../projects/configuration.md).
+
+> 📝 **Tip**
+> 
+> Keys unrecognized by the currently used `sncast` version are ignored with a warning:
+> ```toml
+> [sncast.myprofile]
+> unknown-key = "some value"
+> ```
+> To avoid these warnings, use the latest `sncast` version and update your config to the latest format.
+
+#### `url`
+
+The `url` field specifies the address of RPC provider. It's mutually exclusive with the `network` field.
+
+```toml
+[sncast.myprofile]
+url = "http://example.com"
+```
+
+#### `network`
+
+The `network` field specifies the network to use. It's mutually exclusive with the `url` field.
+
+```toml
+[sncast.myprofile]
+network = "sepolia"
+```
+
+#### `accounts-file`
+
+The `accounts-file` field specifies the path to a file containing account information. 
+If not provided, the default path is `~/.starknet_accounts/starknet_open_zeppelin_accounts.json`.
+
+```toml
+[sncast.myprofile]
+accounts-file = "path/to/accounts.json"
+```
+
+#### `account`
+
+The `account` field specifies which account from the `accounts-file` to use for transactions.
+
+```toml
+[sncast.myprofile]
+account = "user-dev"
+```
+
+#### `keystore`
+
+The `keystore` field specifies the path to the keystore file.
+
+```toml
+[sncast.myprofile]
+keystore = "path/to/keystore"
+```
+
+#### `wait-params`
+
+The `wait-params` field defines the waiting parameters for transactions. By default, timeout (in seconds) is set to `300` and retry-interval (in seconds) to `5`. 
+This means transactions will be checked every `5 seconds`, with a total of `60 attempts` before timing out.
+
+`retry-interval` and `timeout` must be greater than `0`.
+`retry-interval` cannot be greater than `timeout`.
+
+```toml
+[sncast.myprofile]
+wait-params = { timeout = 300, retry-interval = 5 }
+```
+
+#### `fee-params`
+
+The `fee-params` field defines default fee settings for the commands that send transactions - `declare`, `declare-from`, `deploy`, `invoke`, `multicall run`, `multicall execute` and `account deploy`.
+All keys are optional, and the ones that are not set are estimated automatically, just as if no flags were passed.
+
+```toml
+[sncast.myprofile.fee-params]
+l1-gas = 1000
+l1-gas-price = 100000000000
+l2-gas = 5000000
+l2-gas-price = 100000000
+l1-data-gas = 1000
+l1-data-gas-price = 100000000
+tip = 100
+# ...or have the tip estimated instead of setting it explicitly:
+# estimate-tip = true
+```
+
+`tip` cannot be used together with `estimate-tip`.
+
+> 📝 **Note**
+> `max-fee` can only be passed as the `--max-fee` flag - it cannot be set in `snfoundry.toml`.
+
+The resource bounds (`l1-gas`, `l1-gas-price`, `l2-gas`, `l2-gas-price`, `l1-data-gas`, `l1-data-gas-price`) are merged bound by bound, so a flag only overrides the bound it names.
+For example, with `l1-gas` set in the config and `--l2-gas` passed on the command line, both are used.
+Passing `--max-fee` is the exception - it is mutually exclusive with the resource bounds, so it discards **all** the configured bounds instead of being combined with them.
+
+The tip (`tip`, `estimate-tip`) is taken as a whole from the highest-precedence source that defines it, because the two keys are mutually exclusive.
+Passing `--tip` or `--estimate-tip` therefore discards the configured tip, and `estimate-tip = true` in a profile discards a `tip` inherited from a less specific one.
+The tip and the resource bounds do not affect each other, so e.g. passing only `--tip` keeps the configured bounds in force.
+
+#### `show-explorer-links`
+Enable printing links pointing to pages with transaction details in the chosen block explorer
+
+```toml
+[sncast.myprofile]
+show-explorer-links = true
+```
+
+#### `block-explorer`
+
+The `block-explorer` field specifies the block explorer service used to display links to transaction details. 
+
+> 📝 **Note**
+> For details on how block explorers are used in `sncast` and when links are shown, see the [Block Explorers](../starknet/block_explorer.md) section.
+
+| Value     | URL                                    |
+|-----------|----------------------------------------|
+| Voyager   | `https://voyager.online`               |
+| StarkScan | `https://starkscan.co`                 |
+| ViewBlock | `https://viewblock.io/starknet`        |
+| OkLink    | `https://www.oklink.com/starknet`      |
+
+```toml
+[sncast.myprofile]
+block-explorer = "Voyager"
+```
+
+#### `scarb-profile`
+
+The `scarb-profile` field sets which [Scarb profile](https://docs.swmansion.com/scarb/docs/reference/profiles.html) `sncast` uses when it runs `scarb` commands (e.g. `scarb build` when declaring contracts).
+
+Defaults to `release`.
+
+```toml
+[sncast.myprofile]
+scarb-profile = "release"
+```
+
+#### `[sncast.<profile-name>.aliases]`
+
+Frequently used felt values (contract addresses, class hashes, etc.) can be defined in the `aliases` table and later used in commands, e.g. `sncast call --contract-address @map`.
+
+> 📝 **Note**
+> For details on how aliases are used and the list of supported commands, see the [Aliases](../starknet/aliases.md) section.
+
+Aliases follow the same [precedence rules](../projects/configuration.md#interaction-between-local-and-global-profiles) as other `snfoundry.toml` settings, meaning they can be overridden via a higher-precedence config.
+
+```toml
+[sncast.myprofile.aliases]
+map = "0xcd8f9ab31324bb93251837e4efb4223ee195454f6304fcfcb277e277653008"
+map-class = "0x2a09379665a749e609b4a8459c86fe954566a6beeaddd0950e43f6c700ed321"
+```
+
+#### `[sncast.<profile-name>.networks]`
+
+The URLs of the predefined networks can be configured.
+When you use `--network <network_name>`, `sncast` first checks whether you have a custom URL configured for that network.
+In the absence of a user-defined value, the default configuration is applied - public RPC provider is used for `mainnet` and `sepolia`, and the `devnet` endpoint is determined automatically.
+
+```toml
+[sncast.myprofile.networks]
+mainnet = "https://mainnet.your-node.com"
+sepolia = "https://sepolia.your-node.com"
+devnet = "http://127.0.0.1:5050"
+```
+
+#### Complete Example of `snfoundry.toml` File
+
+```toml
+[sncast.myprofile1]
+url = "http://127.0.0.1:5050/"
+accounts-file = "../account-file"
+account = "mainuser"
+keystore = "~/keystore"
+wait-params = { timeout = 500, retry-interval = 10 }
+block-explorer = "Voyager"
+show-explorer-links = true
+scarb-profile = "release"
+
+[sncast.myprofile1.networks]
+mainnet = "https://mainnet.your-node.com"
+sepolia = "https://sepolia.your-node.com"
+devnet = "http://127.0.0.1:5050"
+
+[sncast.myprofile1.fee-params]
+l1-gas = 1000
+l1-gas-price = 100000000000
+l2-gas = 5000000
+l2-gas-price = 100000000
+l1-data-gas = 1000
+l1-data-gas-price = 100000000
+tip = 100
+
+[sncast.dev]
+url = "http://127.0.0.1:5056/rpc"
+account = "devuser"
+```

@@ -1,0 +1,243 @@
+use crate as conversions; // trick for CairoDeserialize macro
+use crate::serde::deserialize::{BufferReadError, BufferReadResult, BufferReader};
+use crate::{serde::serialize::SerializeToFeltVec, string::TryFromHexStr};
+use cairo_lang_utils::byte_array::{BYTE_ARRAY_MAGIC, BYTES_IN_WORD};
+use cairo_serde_macros::{CairoDeserialize, CairoSerialize};
+use starknet_types_core::felt::Felt;
+use std::fmt;
+
+#[derive(CairoDeserialize, CairoSerialize, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "starkloupe", derive(serde::Serialize))]
+pub struct ByteArray {
+    words: Vec<Felt>,
+    pending_word: Felt,
+    pending_word_len: usize,
+}
+
+impl From<&str> for ByteArray {
+    fn from(value: &str) -> Self {
+        let (chunks, remainder) = value.as_bytes().as_chunks::<BYTES_IN_WORD>();
+        let pending_word_len = remainder.len();
+
+        let words = chunks
+            .iter()
+            .map(|chunk| Felt::from_bytes_be_slice(&chunk[..]))
+            .collect();
+
+        let pending_word = Felt::from_bytes_be_slice(remainder);
+
+        Self {
+            words,
+            pending_word,
+            pending_word_len,
+        }
+    }
+}
+
+impl ByteArray {
+    #[must_use]
+    pub fn serialize_with_magic(&self) -> Vec<Felt> {
+        let mut result = self.serialize_to_vec();
+
+        result.insert(
+            0,
+            Felt::try_from_hex_str(&format!("0x{BYTE_ARRAY_MAGIC}")).unwrap(),
+        );
+
+        result
+    }
+
+    pub fn deserialize_with_magic(value: &[Felt]) -> BufferReadResult<ByteArray> {
+        if value.first() == Some(&Felt::try_from_hex_str(&format!("0x{BYTE_ARRAY_MAGIC}")).unwrap())
+        {
+            let mut reader = BufferReader::new(&value[1..]);
+            let byte_array: ByteArray = reader.read()?;
+
+            if reader.into_remaining().is_empty() && byte_array.is_valid() {
+                Ok(byte_array)
+            } else {
+                Err(BufferReadError::ParseFailed)
+            }
+        } else {
+            Err(BufferReadError::ParseFailed)
+        }
+    }
+
+    /// Checks that deserialized data forms a valid `ByteArray`:
+    /// each full word must fit in 31 bytes, the pending word must be shorter
+    /// than a full word and must fit in `pending_word_len` bytes.
+    fn is_valid(&self) -> bool {
+        self.pending_word_len < BYTES_IN_WORD
+            && self.words.iter().all(|word| word.to_bytes_be()[0] == 0)
+            && self.pending_word.to_bytes_be()[..32 - self.pending_word_len]
+                .iter()
+                .all(|&byte| byte == 0)
+    }
+}
+
+fn extend_full_word_bytes(out: &mut Vec<u8>, word: &Felt) {
+    let buf = word.to_bytes_be();
+    out.extend_from_slice(&buf[1..32]);
+}
+
+fn extend_pending_word_bytes(out: &mut Vec<u8>, word: &Felt, len: usize) {
+    let buf = word.to_bytes_be();
+    out.extend_from_slice(&buf[(32 - len)..32]);
+}
+
+impl fmt::Display for ByteArray {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut bytes = Vec::new();
+
+        for word in &self.words {
+            extend_full_word_bytes(&mut bytes, word);
+        }
+
+        extend_pending_word_bytes(&mut bytes, &self.pending_word, self.pending_word_len);
+
+        for b in bytes {
+            match b {
+                // Printable ASCII characters
+                0x20..=0x7E => write!(f, "{}", b as char)?,
+                // Common whitespace characters
+                b'\n' => writeln!(f)?,
+                b'\r' => write!(f, "\r")?,
+                b'\t' => write!(f, "\t")?,
+                // Escape all other bytes to avoid panics (important for fuzz tests)
+                _ => write!(f, "\\x{b:02x}")?,
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_case::test_case;
+
+    #[test]
+    fn test_deserialize_with_magic_roundtrip() {
+        let array = ByteArray::from("this_string_is_longer_than_31_bytes");
+        let serialized = array.serialize_with_magic();
+
+        assert_eq!(
+            ByteArray::deserialize_with_magic(&serialized).unwrap(),
+            array
+        );
+    }
+
+    #[test]
+    fn test_deserialize_with_magic_pending_word_len_too_large() {
+        // [magic, num_full_words, pending_word, pending_word_len]
+        let mut data = ByteArray::from("x").serialize_with_magic();
+        *data.last_mut().unwrap() = Felt::from(32_u8);
+
+        assert!(ByteArray::deserialize_with_magic(&data).is_err());
+    }
+
+    #[test]
+    fn test_deserialize_with_magic_pending_word_len_equal_to_full_word_len() {
+        let mut data = ByteArray::from("x").serialize_with_magic();
+        *data.last_mut().unwrap() = Felt::from(BYTES_IN_WORD);
+
+        assert!(ByteArray::deserialize_with_magic(&data).is_err());
+    }
+
+    #[test]
+    fn test_deserialize_with_magic_pending_word_exceeding_declared_len() {
+        // Pending word contains 3 bytes, but `pending_word_len` claims 1.
+        let mut data = ByteArray::from("abc").serialize_with_magic();
+        *data.last_mut().unwrap() = Felt::from(1_u8);
+
+        assert!(ByteArray::deserialize_with_magic(&data).is_err());
+    }
+
+    #[test]
+    fn test_deserialize_with_magic_declared_full_words_exceeds_buffer() {
+        // The declared full word count must be checked before allocating `words`.
+        let mut data = ByteArray::from("").serialize_with_magic();
+        data[1] = Felt::from(usize::MAX);
+
+        assert!(ByteArray::deserialize_with_magic(&data).is_err());
+    }
+
+    #[test]
+    fn test_deserialize_with_magic_full_word_not_fitting_31_bytes() {
+        let mut data =
+            ByteArray::from("this_string_is_longer_than_31_bytes").serialize_with_magic();
+        // Overwrite the single full word with a felt larger than 31 bytes.
+        data[2] = Felt::MAX;
+
+        assert!(ByteArray::deserialize_with_magic(&data).is_err());
+    }
+
+    #[test]
+    fn test_fmt_empty() {
+        let array = ByteArray::from("");
+        assert_eq!(array.to_string(), "");
+    }
+
+    #[test]
+    fn test_fmt_single_word() {
+        let array = ByteArray::from("Hello");
+        assert_eq!(array.to_string(), "Hello");
+    }
+
+    #[test]
+    fn test_fmt_multiple_words() {
+        let array = ByteArray::from("Hello World! This is a test.");
+        assert_eq!(array.to_string(), "Hello World! This is a test.");
+    }
+
+    #[test]
+    fn test_fmt_with_pending_word() {
+        let array = ByteArray::from("abc");
+        assert_eq!(array.to_string(), "abc");
+    }
+
+    #[test]
+    fn test_fmt_special_chars() {
+        let special_chars = "!@#$%^&*()_+-=[]{}|;:,.<>?";
+        let array = ByteArray::from(special_chars);
+        assert_eq!(array.to_string(), special_chars);
+    }
+
+    #[test_case("Hello\0World", "Hello\\x00World"; "single null byte")]
+    #[test_case("\0\0", "\\x00\\x00"; "two null bytes")]
+    #[test_case("\x01\x02ABC", "\\x01\\x02ABC"; "control chars 0x01 0x02")]
+    #[test_case("\x07Bell", "\\x07Bell"; "bell character")]
+    #[test_case("\x1fEnd", "\\x1fEnd"; "unit separator")]
+    #[test_case("Line1\nLine2", "Line1\nLine2"; "newline preserved")]
+    #[test_case("Col1\tCol2", "Col1\tCol2"; "tab preserved")]
+    #[test_case("CR\rLF", "CR\rLF"; "carriage return preserved")]
+    #[test_case("A\x00B\x01C", "A\\x00B\\x01C"; "mixed printable and escaped")]
+    #[test_case("\x7f", "\\x7f"; "delete character")]
+    fn test_fmt_escaping_non_printable_bytes(input: &str, expected: &str) {
+        let array = ByteArray::from(input);
+        let output = array.to_string();
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_fmt_mixed_ascii() {
+        let mixed = "Hello\tWorld\n123 !@#";
+        let array = ByteArray::from(mixed);
+        assert_eq!(array.to_string(), mixed);
+    }
+
+    #[test]
+    fn test_fmt_with_newlines() {
+        let with_newlines = "First line\nSecond line\r\nThird line";
+        let array = ByteArray::from(with_newlines);
+        assert_eq!(array.to_string(), with_newlines);
+    }
+
+    #[test]
+    fn test_fmt_multiple_newlines() {
+        let multiple_newlines = "Line1\n\n\nLine2\n\nLine3";
+        let array = ByteArray::from(multiple_newlines);
+        assert_eq!(array.to_string(), multiple_newlines);
+    }
+}

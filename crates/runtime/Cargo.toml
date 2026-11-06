@@ -1,0 +1,27 @@
+[package]
+name = "runtime"
+version = "1.0.0"
+edition.workspace = true
+
+[features]
+testing = []
+
+[lints]
+workspace = true
+
+[dependencies]
+indoc.workspace = true
+anyhow.workspace = true
+conversions.workspace = true
+cairo-lang-casm.workspace = true
+cairo-lang-utils.workspace = true
+starknet-types-core.workspace = true
+starknet_api.workspace = true
+starknet-rust.workspace = true
+blockifier.workspace = true
+cairo-vm.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+num-traits.workspace = true
+shared.workspace = true

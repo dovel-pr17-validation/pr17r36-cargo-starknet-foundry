@@ -1,0 +1,22 @@
+use crate::response::cast_message::SncastCommandMessage;
+use foundry_ui::styling;
+use serde::Serialize;
+
+#[derive(Serialize, Clone)]
+pub struct AccountImportResponse {
+    pub add_profile: Option<String>,
+    pub account_name: String,
+}
+
+impl SncastCommandMessage for AccountImportResponse {
+    fn text(&self) -> String {
+        styling::OutputBuilder::new()
+            .success_message("Account imported successfully")
+            .blank_line()
+            .field("Account Name", &self.account_name)
+            .if_some(self.add_profile.as_ref(), |builder, profile| {
+                builder.field("Add Profile", profile)
+            })
+            .build()
+    }
+}

@@ -1,0 +1,121 @@
+use anyhow::{Context, Result};
+use camino::Utf8PathBuf;
+use reqwest::StatusCode;
+use sncast::response::ui::UI;
+use sncast::response::verify::VerifyResponse;
+use sncast::{Network, response::explorer_link::ExplorerError};
+use starknet_rust::providers::{JsonRpcClient, jsonrpc::HttpTransport};
+use std::env;
+use std::ffi::OsStr;
+use walkdir::WalkDir;
+
+use super::explorer::{ContractIdentifier, VerificationInterface, VerificationPayload};
+
+pub struct StarkloupeVerificationInterface {
+    network: Network,
+    workspace_dir: Utf8PathBuf,
+}
+
+impl StarkloupeVerificationInterface {
+    pub fn gather_files(&self) -> Result<Vec<(String, std::path::PathBuf)>> {
+        let mut files = Vec::new();
+
+        for entry in WalkDir::new(self.workspace_dir.clone()).follow_links(true) {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file()
+                && let Some(extension) = path.extension()
+                && (extension == OsStr::new("cairo") || extension == OsStr::new("toml"))
+            {
+                let relative_path = path.strip_prefix(self.workspace_dir.clone())?;
+                files.push((
+                    relative_path.to_string_lossy().into_owned(),
+                    path.to_path_buf(),
+                ));
+            }
+        }
+
+        Ok(files)
+    }
+}
+
+#[async_trait::async_trait]
+impl VerificationInterface<'_> for StarkloupeVerificationInterface {
+    fn new(
+        network: Network,
+        workspace_dir: Utf8PathBuf,
+        _provider: &JsonRpcClient<HttpTransport>,
+        _ui: &UI,
+    ) -> Result<Self> {
+        Ok(StarkloupeVerificationInterface {
+            network,
+            workspace_dir,
+        })
+    }
+
+    async fn verify(
+        &self,
+        identifier: ContractIdentifier,
+        contract_name: String,
+        _package: Option<String>,
+        _test_files: bool,
+        _ui: &UI,
+    ) -> Result<VerifyResponse> {
+        // Read all files name along with their contents in a JSON format
+        // in the workspace dir recursively
+        // key is the file name and value is the file content
+        let mut file_data = serde_json::Map::new();
+
+        // Use the gather_files method to get the list of files
+        let files = self.gather_files()?;
+        for (relative_path, full_path) in files {
+            let file_content = std::fs::read_to_string(full_path)?;
+            file_data.insert(relative_path, serde_json::Value::String(file_content));
+        }
+
+        // Serialize the JSON object to a JSON string
+        let source_code = serde_json::Value::Object(file_data);
+
+        // Create the JSON payload with "contract name," "address," and "source_code" fields
+        let payload = VerificationPayload {
+            contract_name,
+            identifier,
+            source_code,
+        };
+
+        // Serialize the payload to a JSON string for the POST request
+        let json_payload = serde_json::to_string(&payload)?;
+
+        // Send the POST request to the explorer
+        let client = reqwest::Client::new();
+        let api_res = client
+            .post(self.gen_explorer_url()?)
+            .header("Content-Type", "application/json")
+            .body(json_payload)
+            .send()
+            .await
+            .context("Failed to send request to verifier API")?;
+
+        if api_res.status() == StatusCode::OK {
+            let message = api_res
+                .text()
+                .await
+                .context("Failed to read verifier API response")?;
+            Ok(VerifyResponse { message })
+        } else {
+            let message = api_res.text().await.context("Failed to verify contract")?;
+            Err(anyhow::anyhow!("{message}"))
+        }
+    }
+
+    fn gen_explorer_url(&self) -> Result<String> {
+        let api_base_url = env::var("VERIFIER_API_URL")
+            .unwrap_or_else(|_| "https://api.starkloupe.co".to_string());
+        let path = match self.network {
+            Network::Mainnet => "/v1/sn_main/verify",
+            Network::Sepolia => "/v1/sn_sepolia/verify",
+            Network::Devnet => return Err(ExplorerError::DevnetNotSupported.into()),
+        };
+        Ok(format!("{api_base_url}{path}"))
+    }
+}

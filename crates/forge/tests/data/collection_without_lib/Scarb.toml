@@ -1,0 +1,10 @@
+[package]
+name = "collection_without_lib"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+# foo = { path = "vendor/foo" }
+
+[dev-dependencies]
+snforge_std = { path = "../../../../../snforge_std" }

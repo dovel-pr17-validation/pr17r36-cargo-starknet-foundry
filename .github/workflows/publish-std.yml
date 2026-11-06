@@ -1,0 +1,87 @@
+name: Publish snforge_std
+
+on:
+  workflow_call:
+    inputs:
+      prod_registry:
+        required: false
+        type: boolean
+      # Specify the version in MAJOR.MINOR.PATCH format, without a leading 'v'
+      override_std_version:
+        required: false
+        type: string
+      # snforge_std in the repository has a plugin dependency specified as a relative path, which must be overridden each time before publishing.
+      # Specify the version in MAJOR.MINOR.PATCH format, without a leading 'v'
+      plugin_dep_version:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      prod_registry:
+        required: false
+        type: boolean
+      # Specify the version in MAJOR.MINOR.PATCH format, without a leading 'v'
+      override_std_version:
+        required: false
+        type: string
+      # snforge_std in the repository has a plugin dependency specified as a relative path, which must be overridden each time before publishing.
+      # Specify the version in MAJOR.MINOR.PATCH format, without a leading 'v'
+      plugin_dep_version:
+        required: true
+        type: string
+
+jobs:
+  check-uploaded:
+    name: Check std uploaded
+    runs-on: ubuntu-latest
+    outputs:
+      snforge_std_uploaded: ${{ steps.check-uploaded.outputs.snforge_std_uploaded }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check version
+        id: check-uploaded
+        run: |
+          set -exo pipefail
+          
+          source scripts/handle_version.sh
+          
+          snforge_std_version=$(get_version "${{ inputs.override_std_version }}" "snforge_std")
+          
+          registry_url=${{ inputs.prod_registry == true && 'https://scarbs.xyz' || 'https://scarbs.dev' }}
+          
+          snforge_std_uploaded=$(curl -s ${registry_url}/api/v1/index/sn/fo/snforge_std.json | jq --arg version "$snforge_std_version" '[.[] | select(.v == $version)] | length > 0')
+          
+          echo "snforge_std_uploaded=$snforge_std_uploaded" >> $GITHUB_OUTPUT
+  publish-to-registry:
+    name: Publish packages to the registry
+    runs-on: ubuntu-latest
+    needs: [ check-uploaded ]
+    env:
+      SCARB_REGISTRY_AUTH_TOKEN: ${{ inputs.prod_registry == true && secrets.SCARB_REGISTRY_AUTH_TOKEN || secrets.DEV_SCARB_REGISTRY_AUTH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: stable
+
+      - uses: software-mansion/setup-scarb@v1
+        with:
+          cache: false
+        
+      - name: Publish snforge_std
+        if: needs.check-uploaded.outputs.snforge_std_uploaded == 'false'
+        working-directory: snforge_std
+        run: |
+          source ../scripts/handle_version.sh
+          
+          update_version_in_file "Scarb.toml" "${{ inputs.override_std_version }}"
+          
+          if ${{ inputs.prod_registry == true }}; then
+            scarb add snforge_scarb_plugin@${{ inputs.plugin_dep_version }}
+          else
+            sed -i.bak "/snforge_scarb_plugin/ s/\(snforge_scarb_plugin = \).*/\1{ version = \"=${{ inputs.plugin_dep_version }}\", registry = \"https:\/\/scarbs.dev\/\" }/" Scarb.toml
+            rm Scarb.toml.bak 2>/dev/null
+          fi
+          
+          scarb publish --allow-dirty ${{ inputs.prod_registry == true && ' ' || '--index https://scarbs.dev/' }}

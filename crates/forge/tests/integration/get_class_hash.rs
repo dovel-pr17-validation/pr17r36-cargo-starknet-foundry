@@ -1,0 +1,36 @@
+use crate::utils::runner::{Contract, assert_passed};
+use crate::utils::running_tests::run_test_case;
+use crate::utils::test_case;
+use forge_runner::forge_config::ForgeTrackedResource;
+use indoc::indoc;
+use std::path::Path;
+
+#[test]
+fn get_class_hash_cheatcode() {
+    let test = test_case!(
+        indoc!(
+            r#"
+            use core::clone::Clone;
+            use array::ArrayTrait;
+            use result::ResultTrait;
+            use snforge_std::{ declare, ContractClassTrait, get_class_hash, DeclareResultTrait };
+
+            #[test]
+            fn get_class_hash_cheatcode() {
+                let contract = declare("HelloStarknet").unwrap().contract_class().clone();
+                let (contract_address, _) = contract.deploy(@ArrayTrait::new()).unwrap();
+                assert(get_class_hash(contract_address) == contract.class_hash, 'Incorrect class hash');
+            }
+        "#
+        ),
+        Contract::from_code_path(
+            "contract::HelloStarknet".to_string(),
+            Path::new("tests/data/contracts/hello_starknet.cairo"),
+        )
+        .unwrap()
+    );
+
+    let result = run_test_case(&test, ForgeTrackedResource::CairoSteps);
+
+    assert_passed(&result);
+}

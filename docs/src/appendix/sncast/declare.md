@@ -1,0 +1,122 @@
+# `declare`
+Send a declare transaction of Cairo contract to Starknet.
+
+## Required Common Arguments — Passed By CLI or Specified in `snfoundry.toml`
+
+* [`account`](./common.md#--account--a-account_name)
+
+## `--contract-name, -c <CONTRACT_NAME>`
+Required.
+
+Name of the contract. Contract name is a part after the mod keyword in your contract file.
+This argument also accepts a module tree path, for example `hello_sncast::contracts::HelloSncast` or `contracts::HelloSncast`.
+
+## `--url, -u <RPC_URL>`
+Optional.
+
+Starknet RPC node url address.
+
+Overrides url from `snfoundry.toml`.
+
+## `--network <NETWORK>`
+Optional.
+
+Use predefined network with public provider
+
+Possible values: `mainnet`, `sepolia`, `devnet`.
+
+Overrides network from `snfoundry.toml`.
+
+## `--max-fee, -m <MAX_FEE>`
+Optional.
+
+Maximum fee for the `declare` denoted in FRI. Must be greater than zero. If provided, it is not possible to use any of the following fee related flags: `--l1-gas`, `--l1-gas-price`, `--l2-gas`, `--l2-gas-price`, `--l1-data-gas`, `--l1-data-gas-price`.
+
+## `--l1-gas <L1_GAS>`
+Optional.
+
+Maximum L1 gas for the `declare` transaction. When not used, defaults to auto-estimation.
+
+## `--l1-gas-price <l1_gas_price>`
+Optional.
+
+Maximum L1 gas unit price for the `declare` transaction. When not used, defaults to auto-estimation.
+
+## `--l2-gas <L2_GAS>`
+Optional.
+
+Maximum L2 gas for the `declare` transaction. When not used, defaults to auto-estimation.
+
+## `--l2-gas-price <L2_GAS_PRICE>`
+Optional.
+
+Maximum L2 gas unit price for the `declare` transaction. When not used, defaults to auto-estimation.
+
+## `--l1-data-gas <L1_DATA_GAS>`
+Optional.
+
+Maximum L1 data gas for the `declare` transaction. When not used, defaults to auto-estimation.
+
+## `--l1-data-gas-price <l1_data_gas_price>`
+Optional.
+
+Maximum L1 data gas unit price for the `declare` transaction. When not used, defaults to auto-estimation.
+
+## `--tip <TIP>`
+Optional.
+Conflicts with: [`--estimate-tip`](#--estimate-tip-estimate_tip)
+
+Tip for the transaction. When not provided, defaults to 0 unless [`--estimate-tip`](#--estimate-tip-estimate_tip) is used.
+
+## `--estimate-tip`
+Optional.
+Conflicts with: [`--tip`](#--tip-tip)
+
+If passed, an estimated tip will be added to pay for the transaction. The tip is estimated based on the current network conditions and added to the transaction fee.
+
+## `--dry-run`
+Optional.
+Conflicts with all fee related flags: [`--max-fee`](#--max-fee--m-max_fee), [`--l1-gas`](#--l1-gas-l1_gas), [`--l1-gas-price`](#--l1-gas-price-l1_gas_price), [`--l2-gas`](#--l2-gas-l2_gas), [`--l2-gas-price`](#--l2-gas-price-l2_gas_price), [`--l1-data-gas`](#--l1-data-gas-l1_data_gas), [`--l1-data-gas-price`](#--l1-data-gas-price-l1_data_gas_price), [`--tip`](#--tip-tip), [`--estimate-tip`](#--estimate-tip-estimate_tip)
+
+If passed, the transaction will not be sent to the network and the fee will be estimated instead. See also: [`--detailed`](#--detailed).
+
+## `--detailed`
+Optional.
+
+If passed, the output will include detailed fee estimation results instead of just overall fee. Requires [`--dry-run`](#--dry-run) flag to be used.
+
+## `--nonce, -n <NONCE>`
+Optional.
+
+Nonce for transaction. If not provided, nonce will be set automatically.
+
+## `--no-abi`
+Optional.
+
+If passed, omits ABI from the declared class. This changes the resulting class hash.
+
+## `--package <NAME>`
+Optional.
+
+Name of the package that should be used.
+
+If supplied, a contract from this package will be used. Required if more than one package exists in a workspace.
+
+## `--verifier, -v <VERIFIER>`
+Optional.
+
+The verification provider to use for the verification. Possible values are:
+* `starkloupe`
+* `voyager`
+
+## `--confirm-verification`
+Optional.
+
+If passed, assume "yes" as answer to confirmation prompt and run non-interactively.
+Requires [`--verifier`](#--verifier--v-verifier) flag to be used.
+
+## `--test-files`
+Optional.
+
+Include test files under `src/` for verification. Only applies to `voyager`.
+Requires [`--verifier`](#--verifier--v-verifier) flag to be used.

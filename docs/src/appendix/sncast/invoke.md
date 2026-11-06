@@ -1,0 +1,127 @@
+# `invoke`
+Send an invoke transaction to Starknet.
+
+## Required Common Arguments — Passed By CLI or Specified in `snfoundry.toml`
+
+* [`account`](./common.md#--account--a-account_name)
+
+## `--contract-address, -d <CONTRACT_ADDRESS>`
+Required.
+
+The address of the contract being called. It can be either:
+- Felt in hex (prefixed with `0x`) or decimal representation.
+- `@alias` defined in `[sncast.<profile>.aliases]` in `snfoundry.toml`. See [aliases](../../starknet/aliases.md).
+
+## `--function, -f <FUNCTION_NAME>`
+Required.
+
+The name of the function to call.
+
+## `--calldata, -c <CALLDATA>`
+Optional.
+Conflicts with: [`--arguments`](#--arguments)
+
+Inputs to the function, represented by a list of space-delimited values, e.g. `0x1 2 0x3`.
+Each token may be:
+- Felt in hex (prefixed with `0x`) or decimal representation.
+- `@alias` defined in `[sncast.<profile>.aliases]` in `snfoundry.toml`. See [aliases](../../starknet/aliases.md).
+
+## `--arguments`
+Optional.
+Conflicts with: [`--calldata`](#--calldata--c-calldata)
+
+Function arguments provided as a comma-separated string of Cairo expressions.
+For example: `--arguments '1, 2, MyStruct { x: 1, y: 2 }, MyEnum::Variant'`
+
+For more information on supported expressions and syntax, see [Calldata Transformation](../../starknet/calldata-transformation.md).
+
+## `--url, -u <RPC_URL>`
+Optional.
+
+Starknet RPC node url address.
+
+Overrides url from `snfoundry.toml`.
+
+## `--network <NETWORK>`
+Optional.
+
+Use predefined network with public provider
+
+Possible values: `mainnet`, `sepolia`, `devnet`.
+
+Overrides network from `snfoundry.toml`.
+
+## `--max-fee, -m <MAX_FEE>`
+Optional.
+
+Maximum fee for the `invoke` denoted in FRI. Must be greater than zero. If provided, it is not possible to use any of the following fee related flags: `--l1-gas`, `--l1-gas-price`, `--l2-gas`, `--l2-gas-price`, `--l1-data-gas`, `--l1-data-gas-price`.
+
+## `--l1-gas <L1_GAS>`
+Optional.
+
+Maximum L1 gas for the `invoke` transaction. When not used, defaults to auto-estimation.
+
+## `--l1-gas-price <l1_gas_price>`
+Optional.
+
+Maximum L1 gas unit price for the `invoke` transaction. When not used, defaults to auto-estimation.
+
+## `--l2-gas <L2_GAS>`
+Optional.
+
+Maximum L2 gas for the `invoke` transaction. When not used, defaults to auto-estimation.
+
+## `--l2-gas-price <L2_GAS_PRICE>`
+Optional.
+
+Maximum L2 gas unit price for the `invoke` transaction. When not used, defaults to auto-estimation.
+
+## `--l1-data-gas <L1_DATA_GAS>`
+Optional.
+
+Maximum L1 data gas for the `invoke` transaction. When not used, defaults to auto-estimation.
+
+## `--l1-data-gas-price <l1_data_gas_price>`
+Optional.
+
+Maximum L1 data gas unit price for the `invoke` transaction. When not used, defaults to auto-estimation.
+
+## `--tip <TIP>`
+Optional.
+Conflicts with: [`--estimate-tip`](#--estimate-tip-estimate_tip)
+
+Tip for the transaction. When not provided, defaults to 0 unless [`--estimate-tip`](#--estimate-tip-estimate_tip) is used.
+
+## `--estimate-tip`
+Optional.
+Conflicts with: [`--tip`](#--tip-tip)
+
+If passed, an estimated tip will be added to pay for the transaction. The tip is estimated based on the current network conditions and added to the transaction fee.
+
+## `--dry-run`
+Optional.
+Conflicts with all fee related flags: [`--max-fee`](#--max-fee--m-max_fee), [`--l1-gas`](#--l1-gas-l1_gas), [`--l1-gas-price`](#--l1-gas-price-l1_gas_price), [`--l2-gas`](#--l2-gas-l2_gas), [`--l2-gas-price`](#--l2-gas-price-l2_gas_price), [`--l1-data-gas`](#--l1-data-gas-l1_data_gas), [`--l1-data-gas-price`](#--l1-data-gas-price-l1_data_gas_price), [`--tip`](#--tip-tip), [`--estimate-tip`](#--estimate-tip-estimate_tip)
+
+If passed, the transaction will not be sent to the network and the fee will be estimated instead. See also: [`--detailed`](#--detailed).
+
+## `--detailed`
+Optional.
+
+If passed, the output will include detailed fee estimation results instead of just overall fee. Requires [`--dry-run`](#--dry-run) flag to be used.
+
+## `--nonce, -n <NONCE>`
+Optional.
+
+Nonce for transaction. If not provided, nonce will be set automatically.
+
+## `--proof-file <PROOF_FILE>`
+Optional.
+Must be passed together with [`--proof-facts-file`](#--proof-facts-file-proof_facts_file)
+
+Path to a plain text file containing a proof (base64-encoded string).
+
+## `--proof-facts-file <PROOF_FACTS_FILE>`
+Optional.
+Must be passed together with [`--proof-file`](#--proof-file-proof_file)
+
+Path to a plain text file containing proof facts (comma-separated felt values).

@@ -1,0 +1,153 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shared",
+    "crates/forge",
+    "crates/forge-runner",
+    "crates/sncast",
+    "crates/cheatnet",
+    "crates/conversions",
+    "crates/conversions/cairo-serde-macros",
+    "crates/data-transformer",
+    "crates/runtime",
+    "crates/scarb-api",
+    "crates/configuration",
+    "crates/universal-sierra-compiler-api",
+    "crates/docs",
+    "crates/debugging",
+    "crates/testing/packages_validation",
+    "crates/foundry-ui",
+    "crates/native-api",
+]
+
+exclude = ["crates/snforge-scarb-plugin"]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+[profile.ci]
+inherits = "dev"
+incremental = false
+debug = "line-tables-only"
+
+[workspace.package]
+version = "0.64.1"
+edition = "2024"
+repository = "https://github.com/foundry-rs/starknet-foundry"
+license = "MIT"
+license-file = "LICENSE"
+
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+assert_is_empty = "allow"
+
+[workspace.dependencies]
+blockifier = { version = "0.20.0-rc.1", features = ["testing", "tracing", "node_api"] }
+starknet_api = "0.20.0-rc.1"
+bigdecimal = "0.4.10"
+cairo-debugger = { git = "https://github.com/software-mansion-labs/cairo-debugger", rev = "788dc4ab8f16509334b36a84c43ee884574975d6" }
+cairo-native = "0.9.0-rc.7"
+cairo-lang-casm = { version = "=2.19.5", features = ["serde"] }
+cairo-lang-sierra = "=2.19.5"
+cairo-lang-utils = "=2.19.5"
+cairo-lang-starknet = "=2.19.5"
+cairo-lang-filesystem = "=2.19.5"
+cairo-lang-diagnostics = "=2.19.5"
+cairo-lang-syntax = "=2.19.5"
+cairo-lang-test-plugin = "=2.19.5"
+cairo-lang-starknet-classes = "=2.19.5"
+cairo-lang-parser = "=2.19.5"
+cairo-lang-sierra-to-casm = "=2.19.5"
+cairo-vm = { version = "=3.2.0", features = ["test_utils"] }
+cairo-annotations = { version = "0.10.0", features = ["cairo-lang"] }
+dirs = "7.0.0"
+dialoguer = "0.12.0"
+starknet-types-core = { version = "0.2.4", features = ["hash", "prime-bigint"] }
+starknet-curve = "0.6.0"
+anyhow = "1.0.100"
+assert_fs = "1.1.4"
+camino = { version = "1.2.1", features = ["serde1"] }
+clap = { version = "4.5.57", features = ["derive", "deprecated"] }
+clap_complete = "4.6.5"
+console = "0.16.1"
+include_dir = "0.7.4"
+indoc = "2"
+itertools = "0.15.0"
+indexmap = "2.11.4"
+num-traits = "0.2.19"
+rayon = "1.10"
+regex = "1.11.3"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.149"
+starknet-rust = "0.20.1"
+starknet-rust-crypto = "0.20.1"
+tempfile = "3.24.0"
+thiserror = "2.0.17"
+ctor = "1.0.7"
+dtor = "1.0.5"
+url = { "version" = "2.5.4", "features" = ["serde"] }
+tokio = { version = "1.52.3", features = ["full"] }
+futures = "0.3.31"
+num-bigint = { version = "0.4.6", features = ["rand"] }
+walkdir = "2.5.0"
+rand = "0.8.6"
+project-root = "0.2.2"
+which = "8.0.2"
+conversions = { path = "./crates/conversions" }
+shared = { path = "./crates/shared" }
+docs = { path = "./crates/docs" }
+test-case = "3.3.1"
+scarb-metadata = "1.14.0"
+flatten-serde-json = "0.1.0"
+snapbox = "1.2.2"
+scarb-ui = "0.1.7"
+semver = "1.0.27"
+bimap = "0.6.3"
+primitive-types = { version = "0.14.0", features = ["serde"] }
+shellexpand = "3.1.0"
+toml = "1.0.6"
+rpassword = "7.5.4"
+promptly = "0.3.1"
+ptree = "0.5.2"
+reqwest = { version = "0.13.3", features = ["json"] }
+fs_extra = "1.3.0"
+openssl = { version = "0.10", features = ["vendored"] }
+toml_edit = "0.25.12"
+axum = "0.8.8"
+fs2 = "0.4.3"
+flate2 = "1.1.0"
+k256 = { version = "0.13.4", features = ["sha256", "ecdsa", "serde"] }
+p256 = { version = "0.13.2", features = ["sha256", "ecdsa", "serde"] }
+glob = "0.3.2"
+sha3 = "0.12.0"
+sha2 = "0.11.0"
+async-trait = "0.1.87"
+serde_path_to_error = "0.1.20"
+serde_with = "3.20.0"
+wiremock = "0.6.3"
+coins-ledger = "0.13.0"
+speculos-client = { git = "https://github.com/software-mansion/starknet-rust", rev = "2ddf17ba28625453b8b554d02a3d8ebf4996f4f0" }
+const-hex = "1.19.0"
+indicatif = "0.18.3"
+shell-words = "1.1.0"
+sanitize-filename = "0.6.0"
+derive_more = { version = "2.1.1", features = ["display"] }
+paste = "1.0.15"
+strum = "0.28"
+strum_macros = "0.28"
+scarb-oracle-hint-service = "0.1.1"
+chrono = "0.4.42"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tracing = "0.1.43"
+tracing-chrome = "0.7.2"
+tracing-log = "0.2.0"
+comfy-table = "8"
+create-output-dir = "1.0.0"
+insta = { version = "1.46.0", features = ["filters"] }
+plotters = { version = "0.3", default-features = false, features = ["all_series", "all_elements", "svg_backend", "bitmap_backend", "bitmap_encoder", "full_palette", "colormaps", "ab_glyph"] }
+mimalloc = "0.1"

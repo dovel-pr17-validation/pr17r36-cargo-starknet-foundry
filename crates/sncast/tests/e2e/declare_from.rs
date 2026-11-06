@@ -1,0 +1,687 @@
+use crate::helpers::constants::{
+    CONTRACTS_DIR, MAP_CONTRACT_CLASS_HASH_SEPOLIA, SEPOLIA_RPC_URL, URL,
+};
+use crate::helpers::fixtures::{
+    create_and_deploy_oz_account, duplicate_contract_directory_with_salt, get_accounts_path,
+    join_tempdirs,
+};
+use crate::helpers::output::get_declared_class_hash_from_json_output;
+use crate::helpers::runner::runner;
+use configuration::test_utils::copy_config_to_tempdir;
+use indoc::indoc;
+use scarb_api::ScarbCommand;
+use shared::test_utils::output_assert::{assert_stderr_contains, assert_stdout_contains};
+use starknet_rust::core::types::contract::SierraClass;
+use std::fs;
+use std::process::Stdio;
+use tempfile::tempdir;
+
+const EXAMPLE_CONTRACT_CLASS_HASH_SEPOLIA: &str =
+    "0x2234766d7693f0f081e1804ac121348eaaa35ed9e268bd334744142b83afde4";
+
+#[tokio::test]
+async fn test_happy_case() {
+    let temp_dir = tempdir().expect("Unable to create a temporary directory");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare-from",
+        "--class-hash",
+        EXAMPLE_CONTRACT_CLASS_HASH_SEPOLIA,
+        "--source-url",
+        SEPOLIA_RPC_URL,
+        "--url",
+        URL,
+    ];
+
+    let snapbox = runner(&args)
+        .env("SNCAST_FORCE_SHOW_EXPLORER_LINKS", "1")
+        .current_dir(temp_dir.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc::formatdoc! {r"
+        Success: Declaration completed
+
+        Class Hash:       {}
+        Transaction Hash: 0x[..]
+
+        To see declaration details, visit:
+        class: https://[..]
+        transaction: https://[..]
+    ", EXAMPLE_CONTRACT_CLASS_HASH_SEPOLIA },
+    );
+}
+
+#[tokio::test]
+async fn test_happy_case_with_block_id() {
+    let temp_dir = tempdir().expect("Unable to create a temporary directory");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let example_b_contract_class_hash_sepolia =
+        "0x056c86d7cb232aacd0218e3879577814cddb91527d8898fb4355dd221099a276";
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user2",
+        "declare-from",
+        "--class-hash",
+        example_b_contract_class_hash_sepolia,
+        "--source-url",
+        SEPOLIA_RPC_URL,
+        "--url",
+        URL,
+        "--block-id",
+        "latest",
+    ];
+
+    let snapbox = runner(&args)
+        .env("SNCAST_FORCE_SHOW_EXPLORER_LINKS", "1")
+        .current_dir(temp_dir.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc! {r"
+        Success: Declaration completed
+
+        Class Hash:       0x56c86d7cb232aacd0218e3879577814cddb91527d8898fb4355dd221099a276
+        Transaction Hash: 0x[..]
+
+        To see declaration details, visit:
+        class: https://[..]
+        transaction: https://[..]
+    " },
+    );
+}
+
+#[tokio::test]
+async fn test_dry_run() {
+    let temp_dir = tempdir().expect("Unable to create a temporary directory");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare-from",
+        "--class-hash",
+        EXAMPLE_CONTRACT_CLASS_HASH_SEPOLIA,
+        "--source-url",
+        SEPOLIA_RPC_URL,
+        "--url",
+        URL,
+        "--dry-run",
+    ];
+
+    let snapbox = runner(&args).current_dir(temp_dir.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc! {
+            "
+            Success: Dry run completed
+
+            Overall Fee: [..] Fri (~[..] STRK)
+            "
+        },
+    );
+}
+
+#[tokio::test]
+async fn test_dry_run_detailed() {
+    let temp_dir = tempdir().expect("Unable to create a temporary directory");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare-from",
+        "--class-hash",
+        EXAMPLE_CONTRACT_CLASS_HASH_SEPOLIA,
+        "--source-url",
+        SEPOLIA_RPC_URL,
+        "--url",
+        URL,
+        "--dry-run",
+        "--detailed",
+    ];
+    let snapbox = runner(&args).current_dir(temp_dir.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc! {
+            "
+            Success: Dry run completed
+
+            Overall Fee: [..] Fri (~[..] STRK)
+            L1 Gas Consumed:      [..]
+            L1 Gas Price:         [..]
+            L2 Gas Consumed:      [..]
+            L2 Gas Price:         [..]
+            L1 Data Gas Consumed: [..]
+            L1 Data Gas Price:    [..]
+            "
+        },
+    );
+}
+
+#[tokio::test]
+async fn test_contract_already_declared() {
+    let temp_dir = tempdir().expect("Unable to create a temporary directory");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user3",
+        "declare-from",
+        "--class-hash",
+        MAP_CONTRACT_CLASS_HASH_SEPOLIA,
+        "--source-url",
+        SEPOLIA_RPC_URL,
+        "--url",
+        URL,
+    ];
+
+    let snapbox = runner(&args).current_dir(temp_dir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Command: declare-from
+        Error: Contract with class hash 0x0[..] is already declared
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_class_hash_does_not_exist_on_source_network() {
+    let temp_dir = tempdir().expect("Unable to create a temporary directory");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare-from",
+        "--class-hash",
+        "0x1",
+        "--source-url",
+        SEPOLIA_RPC_URL,
+        "--url",
+        URL,
+    ];
+
+    let snapbox = runner(&args).current_dir(temp_dir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Command: declare-from
+        Error: Provided class hash does not exist
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_source_rpc_args_not_passed() {
+    let temp_dir = tempdir().expect("Unable to create a temporary directory");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare-from",
+        "--class-hash",
+        "0x1",
+        "--url",
+        URL,
+    ];
+
+    let snapbox = runner(&args).current_dir(temp_dir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Error: Either `--source-network` or `--source-url` must be provided
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_invalid_block_id() {
+    let temp_dir = tempdir().expect("Unable to create a temporary directory");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare-from",
+        "--class-hash",
+        "0x1",
+        "--url",
+        URL,
+        "--block-id",
+        "0x10101",
+    ];
+
+    let snapbox = runner(&args).current_dir(temp_dir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Error: Either `--source-network` or `--source-url` must be provided
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_declare_from_sierra_happy_case() {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        "declare_from_file_happy",
+    );
+
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let build_output = ScarbCommand::new()
+        .arg("build")
+        .current_dir(tempdir.path())
+        .command()
+        .stderr(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .output()
+        .expect("Failed to run `scarb build`");
+
+    assert!(build_output.status.success(), "`scarb build` failed");
+    let sierra_path = tempdir
+        .path()
+        .join("target/dev/map_Map.contract_class.json");
+    assert!(
+        sierra_path.exists(),
+        "sierra artifact not found at {sierra_path:?}"
+    );
+    let sierra_path = sierra_path.to_str().unwrap();
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "declare-from",
+        "--sierra-file",
+        sierra_path,
+        "--url",
+        URL,
+    ];
+
+    let snapbox = runner(&args)
+        .env("SNCAST_FORCE_SHOW_EXPLORER_LINKS", "1")
+        .current_dir(tempdir.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc! {r"
+        Success: Declaration completed
+
+        Class Hash:       0x[..]
+        Transaction Hash: 0x[..]
+
+        To see declaration details, visit:
+        class: https://[..]
+        transaction: https://[..]
+    "},
+    );
+}
+
+#[tokio::test]
+async fn test_declare_from_sierra_happy_case_no_abi() {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        "declare_from_file_happy_no_abi",
+    );
+
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let build_output = ScarbCommand::new()
+        .arg("build")
+        .current_dir(tempdir.path())
+        .command()
+        .stderr(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .output()
+        .expect("Failed to run `scarb build`");
+
+    assert!(build_output.status.success(), "`scarb build` failed");
+    let sierra_path = tempdir
+        .path()
+        .join("target/dev/map_Map.contract_class.json");
+    assert!(
+        sierra_path.exists(),
+        "sierra artifact not found at {sierra_path:?}"
+    );
+    let mut sierra_class: SierraClass = serde_json::from_str(
+        &fs::read_to_string(&sierra_path).expect("Failed to read sierra artifact"),
+    )
+    .expect("Failed to parse sierra artifact");
+    let original_class_hash = sierra_class
+        .class_hash()
+        .expect("Failed to compute class hash");
+    sierra_class.abi.clear();
+    let stripped_class_hash = sierra_class
+        .class_hash()
+        .expect("Failed to compute class hash without ABI");
+    let sierra_path = sierra_path.to_str().unwrap();
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "--json",
+        "declare-from",
+        "--sierra-file",
+        sierra_path,
+        "--url",
+        URL,
+        "--no-abi",
+    ];
+
+    let output = runner(&args)
+        .current_dir(tempdir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let declared_class_hash = get_declared_class_hash_from_json_output(&output);
+    assert_ne!(declared_class_hash, original_class_hash);
+    assert_eq!(declared_class_hash, stripped_class_hash);
+}
+
+#[tokio::test]
+async fn test_declare_from_sierra_does_not_exist() {
+    let temp_dir = tempdir().expect("Unable to create a temporary directory");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare-from",
+        "--sierra-file",
+        "/nonexistent/path/contract.contract_class.json",
+        "--url",
+        URL,
+    ];
+    let snapbox = runner(&args).current_dir(temp_dir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Command: declare-from
+        Error: Failed to read sierra file at [..]contract_class.json
+
+        Caused by:
+            No such file or directory [..]
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_declare_from_sierra_invalid_json() {
+    let temp_dir = tempdir().expect("Unable to create a temporary directory");
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+    let invalid_sierra_path = temp_dir.path().join("invalid_contract_class.json");
+    fs::write(&invalid_sierra_path, r#"{"not": "a valid sierra"}"#).unwrap();
+    let invalid_sierra_path = invalid_sierra_path.to_str().unwrap().to_string();
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare-from",
+        "--sierra-file",
+        invalid_sierra_path.as_str(),
+        "--url",
+        URL,
+    ];
+    let snapbox = runner(&args).current_dir(temp_dir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Command: declare-from
+        Error: Failed to parse sierra file
+
+        Caused by:
+            missing field `sierra_program` at line 1 column 25
+        "},
+    );
+}
+
+#[tokio::test]
+async fn test_declare_from_sierra_already_declared() {
+    let contract_path = duplicate_contract_directory_with_salt(
+        CONTRACTS_DIR.to_string() + "/map",
+        "put",
+        "declare_from_file_already_declared",
+    );
+    let tempdir = create_and_deploy_oz_account().await;
+    join_tempdirs(&contract_path, &tempdir);
+
+    let build_output = ScarbCommand::new()
+        .arg("build")
+        .current_dir(tempdir.path())
+        .command()
+        .output()
+        .expect("Failed to run `scarb build`");
+    assert!(build_output.status.success(), "`scarb build` failed");
+
+    let sierra_path = tempdir
+        .path()
+        .join("target/dev/map_Map.contract_class.json");
+    let sierra_path = sierra_path.to_str().unwrap();
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "declare-from",
+        "--sierra-file",
+        sierra_path,
+        "--url",
+        URL,
+    ];
+
+    runner(&args).current_dir(tempdir.path()).assert().success();
+
+    let args = vec![
+        "--accounts-file",
+        "accounts.json",
+        "--account",
+        "my_account",
+        "declare-from",
+        "--sierra-file",
+        sierra_path,
+        "--url",
+        URL,
+    ];
+    let snapbox = runner(&args).current_dir(tempdir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Command: declare-from
+        Error: Contract with class hash 0x0[..] is already declared
+        "},
+    );
+}
+
+#[test]
+fn test_declare_from_requires_sierra_file_or_class_hash() {
+    let temp_dir = tempdir().expect("Unable to create a temporary directory");
+    let args = vec!["declare-from", "--url", URL];
+    let snapbox = runner(&args).current_dir(temp_dir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        error: the following required arguments were not provided:
+          <--sierra-file <SIERRA_FILE>|--class-hash <CLASS_HASH>>
+
+        Usage: sncast declare-from --url <URL> <--sierra-file <SIERRA_FILE>|--class-hash <CLASS_HASH>>
+
+        For more information, try '--help'.
+        "},
+    );
+}
+
+#[test]
+fn test_declare_from_conflicting_contract_source() {
+    let temp_dir = tempdir().expect("Unable to create a temporary directory");
+    let args = vec![
+        "declare-from",
+        "--class-hash",
+        "0x1",
+        "--sierra-file",
+        "path/to/sierra.json",
+        "--url",
+        URL,
+    ];
+    let snapbox = runner(&args).current_dir(temp_dir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        error: the argument '--class-hash <CLASS_HASH>' cannot be used with '--sierra-file <SIERRA_FILE>'
+
+        Usage: sncast declare-from --url <URL> <--sierra-file <SIERRA_FILE>|--class-hash <CLASS_HASH>>
+
+        For more information, try '--help'.
+        "},
+    );
+}
+
+#[test]
+fn test_declare_from_no_abi_with_class_hash_disallowed() {
+    let temp_dir = tempdir().expect("Unable to create a temporary directory");
+    let args = vec![
+        "declare-from",
+        "--class-hash",
+        "0x1",
+        "--no-abi",
+        "--url",
+        URL,
+    ];
+    let snapbox = runner(&args).current_dir(temp_dir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        "error: the argument '--class-hash <CLASS_HASH>' cannot be used with '--no-abi'",
+    );
+}
+
+#[tokio::test]
+async fn test_declare_from_with_alias() {
+    let temp_dir = copy_config_to_tempdir("tests/data/files/snfoundry_aliases.toml", None);
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare-from",
+        "--class-hash",
+        "@example-class",
+        "--source-url",
+        SEPOLIA_RPC_URL,
+        // Note: this avoids "already declared" error caused by happy tests
+        "--dry-run",
+    ];
+
+    let snapbox = runner(&args).current_dir(temp_dir.path());
+    let output = snapbox.assert().success();
+
+    assert_stdout_contains(
+        output,
+        indoc! {
+            "
+            Success: Dry run completed
+
+            Overall Fee: [..] Fri (~[..] STRK)
+            "
+        },
+    );
+}
+
+#[tokio::test]
+async fn test_declare_from_with_unknown_alias() {
+    let temp_dir = copy_config_to_tempdir("tests/data/files/snfoundry_aliases.toml", None);
+    let accounts_json_path = get_accounts_path("tests/data/accounts/accounts.json");
+
+    let args = vec![
+        "--accounts-file",
+        accounts_json_path.as_str(),
+        "--account",
+        "user1",
+        "declare-from",
+        "--class-hash",
+        "@unknown",
+        "--source-url",
+        SEPOLIA_RPC_URL,
+    ];
+
+    let snapbox = runner(&args).current_dir(temp_dir.path());
+    let output = snapbox.assert().failure();
+
+    assert_stderr_contains(
+        output,
+        indoc! {r"
+        Command: declare-from
+        Error: Invalid class hash
+
+        Caused by:
+            Alias `unknown` not found in config
+        "},
+    );
+}

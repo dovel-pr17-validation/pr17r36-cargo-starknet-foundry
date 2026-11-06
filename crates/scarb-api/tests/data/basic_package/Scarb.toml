@@ -1,0 +1,10 @@
+[package]
+name = "basic_package"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+starknet = "2.8.5"
+snforge_std = { path = "../../../../../snforge_std" }
+
+[[target.starknet-contract]]

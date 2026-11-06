@@ -1,0 +1,211 @@
+use crate::shared_cache::FILE_WITH_PREV_TESTS_FAILED;
+use crate::{CleanArgs, CleanComponent};
+use anyhow::{Context, Result, ensure};
+use camino::{Utf8Path, Utf8PathBuf};
+use foundry_ui::UI;
+use regex::Regex;
+use scarb_api::metadata::{MetadataOpts, metadata_with_opts};
+use semver::Version;
+use shared::cache::{
+    CACHEDIR_TAG_CONTENTS, CACHEDIR_TAG_FILENAME, USC_CACHE_DIR, resolve_cache_dir,
+};
+use std::fs;
+use std::sync::OnceLock;
+
+const COVERAGE_DIR: &str = "coverage";
+const PROFILE_DIR: &str = "profile";
+const TRACE_DIR: &str = "snfoundry_trace";
+
+fn fork_cache_file_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"^[a-zA-Z0-9_]+_\d+_v(?<version>[A-Za-z0-9_.+-]+)\.json$").unwrap()
+    })
+}
+
+pub fn clean(args: CleanArgs, ui: &UI) -> Result<()> {
+    let components = if args.clean_components.contains(&CleanComponent::All) {
+        ensure!(
+            args.clean_components.len() == 1,
+            "The 'all' component cannot be combined with other components"
+        );
+        vec![
+            CleanComponent::Trace,
+            CleanComponent::Profile,
+            CleanComponent::Cache,
+            CleanComponent::Coverage,
+        ]
+    } else {
+        args.clean_components
+    };
+
+    let scarb_metadata = metadata_with_opts(MetadataOpts {
+        no_deps: true,
+        ..MetadataOpts::default()
+    })?;
+    let workspace_root = scarb_metadata.workspace.root;
+    let packages_root: Vec<Utf8PathBuf> = scarb_metadata
+        .packages
+        .into_iter()
+        .map(|package_metadata| package_metadata.root)
+        .collect();
+
+    for component in &components {
+        match component {
+            CleanComponent::Coverage => packages_root
+                .iter()
+                .try_for_each(|root| clean_dir(&root.join(COVERAGE_DIR), ui))?,
+            CleanComponent::Profile => packages_root
+                .iter()
+                .try_for_each(|root| clean_dir(&root.join(PROFILE_DIR), ui))?,
+            CleanComponent::Cache => clean_cache_dir(&resolve_cache_dir(&workspace_root)?, ui)?,
+            CleanComponent::Trace => packages_root
+                .iter()
+                .try_for_each(|root| clean_dir(&root.join(TRACE_DIR), ui))?,
+            CleanComponent::All => unreachable!("All component should have been handled earlier"),
+        }
+    }
+
+    Ok(())
+}
+
+fn clean_dir(path: &Utf8Path, ui: &UI) -> Result<()> {
+    if path.exists() {
+        fs::remove_dir_all(path).with_context(|| format!("Failed to remove directory: {path}"))?;
+        ui.println(&format!("Removed directory: {path}"));
+    }
+
+    Ok(())
+}
+
+pub fn clean_cache_dir(path: &Utf8Path, ui: &UI) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let mut any_skipped = false;
+    for entry in path
+        .read_dir_utf8()
+        .with_context(|| format!("Failed to read cache directory: {path}"))?
+    {
+        let entry = entry.with_context(|| format!("Failed to read cache directory: {path}"))?;
+        let entry_path = entry.path();
+
+        if is_usc_cache(entry_path) {
+            fs::remove_dir_all(entry_path)
+                .with_context(|| format!("Failed to remove cache directory: {entry_path}"))?;
+            ui.println(&format!("Removed directory: {entry_path}"));
+        } else if is_snfoundry_cache_file(entry_path) {
+            fs::remove_file(entry_path)
+                .with_context(|| format!("Failed to remove cache file: {entry_path}"))?;
+            ui.println(&format!("Removed file: {entry_path}"));
+        } else {
+            any_skipped = true;
+        }
+    }
+
+    if !any_skipped {
+        fs::remove_dir(path).with_context(|| format!("Failed to remove directory: {path}"))?;
+        ui.println(&format!("Removed directory: {path}"));
+    }
+
+    Ok(())
+}
+
+fn is_snfoundry_cache_file(path: &Utf8Path) -> bool {
+    let Some(file_name) = path.file_name() else {
+        return false;
+    };
+
+    if file_name == FILE_WITH_PREV_TESTS_FAILED {
+        return true;
+    }
+
+    if file_name == CACHEDIR_TAG_FILENAME {
+        return fs::read_to_string(path)
+            .is_ok_and(|contents| contents.contains(CACHEDIR_TAG_CONTENTS));
+    }
+
+    let Some(captures) = fork_cache_file_regex().captures(file_name) else {
+        return false;
+    };
+
+    let version = captures.name("version").unwrap().as_str();
+    Version::parse(&version.replace('_', ".")).is_ok()
+}
+
+fn is_usc_cache(path: &Utf8Path) -> bool {
+    path.is_dir() && path.file_name() == Some(USC_CACHE_DIR)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_snfoundry_cache_file;
+    use camino::Utf8Path;
+    use shared::cache::{CACHEDIR_TAG_CONTENTS, CACHEDIR_TAG_FILENAME};
+    use std::fs;
+
+    #[test]
+    fn recognizes_prev_failed_tests_file() {
+        assert!(is_snfoundry_cache_file(Utf8Path::new(".prev_tests_failed")));
+    }
+
+    #[test]
+    fn recognizes_cachedir_tag() {
+        let temp = tempfile::tempdir().unwrap();
+        let tag_path = temp.path().join(CACHEDIR_TAG_FILENAME);
+        fs::write(&tag_path, CACHEDIR_TAG_CONTENTS).unwrap();
+
+        assert!(is_snfoundry_cache_file(
+            Utf8Path::from_path(&tag_path).unwrap()
+        ));
+    }
+
+    #[test]
+    fn rejects_cachedir_tag_not_created_by_snfoundry() {
+        let temp = tempfile::tempdir().unwrap();
+        let tag_path = temp.path().join(CACHEDIR_TAG_FILENAME);
+        fs::write(
+            &tag_path,
+            "Signature: 8a477f597d28d172789f06886806bc55\n# Created by another tool.\n",
+        )
+        .unwrap();
+
+        assert!(!is_snfoundry_cache_file(
+            Utf8Path::from_path(&tag_path).unwrap()
+        ));
+    }
+
+    #[test]
+    fn recognizes_rpc_cache_file() {
+        assert!(is_snfoundry_cache_file(Utf8Path::new(
+            "http_111_222_333_444_5050_123_v0_1_0.json"
+        )));
+    }
+
+    #[test]
+    fn rejects_file_without_json_extension() {
+        assert!(!is_snfoundry_cache_file(Utf8Path::new(
+            "http_111_222_333_444_5050_123_v0_1_0.txt"
+        )));
+    }
+
+    #[test]
+    fn rejects_file_with_non_numeric_block_number() {
+        assert!(!is_snfoundry_cache_file(Utf8Path::new(
+            "http_111_222_333_444_5050_latest_v0_1_0.json"
+        )));
+    }
+
+    #[test]
+    fn rejects_file_with_incomplete_version() {
+        assert!(!is_snfoundry_cache_file(Utf8Path::new(
+            "http_111_222_333_444_5050_123_v0_1.json"
+        )));
+    }
+
+    #[test]
+    fn rejects_file_with_empty_sanitized_url() {
+        assert!(!is_snfoundry_cache_file(Utf8Path::new("_123_v0_1_0.json")));
+    }
+}

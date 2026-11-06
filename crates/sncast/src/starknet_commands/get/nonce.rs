@@ -1,0 +1,57 @@
+use crate::starknet_commands::utils::felt_or_id::ContractAddress;
+use anyhow::Result;
+use clap::Args;
+use sncast::get_block_id;
+use sncast::helpers::command::process_command_result;
+use sncast::helpers::configuration::CastConfig;
+use sncast::helpers::rpc::RpcArgs;
+use sncast::response::errors::{StarknetCommandError, handle_starknet_command_error};
+use sncast::response::get::nonce::NonceResponse;
+use sncast::response::ui::UI;
+use starknet_rust::core::types::BlockId;
+use starknet_rust::providers::jsonrpc::HttpTransport;
+use starknet_rust::providers::{JsonRpcClient, Provider};
+use starknet_types_core::felt::Felt;
+use std::process::ExitCode;
+
+#[derive(Debug, Args)]
+#[command(about = "Get the nonce of a contract")]
+pub struct Nonce {
+    /// Address of the contract (hex, decimal, or @alias from snfoundry.toml)
+    pub contract_address: ContractAddress,
+
+    /// Block identifier on which nonce should be fetched.
+    /// Possible values: `pre_confirmed`, `latest`, block hash (0x prefixed string)
+    /// and block number (u64)
+    #[arg(short, long, default_value = "pre_confirmed")]
+    pub block_id: String,
+
+    #[command(flatten)]
+    pub rpc: RpcArgs,
+}
+
+pub async fn nonce(nonce: Nonce, config: CastConfig, ui: &UI) -> Result<ExitCode> {
+    let contract_address = nonce.contract_address.resolve(&config)?;
+    let block_id = get_block_id(&nonce.block_id)?;
+
+    let provider = nonce.rpc.get_provider(&config, ui).await?;
+
+    let result = get_nonce(&provider, contract_address, block_id)
+        .await
+        .map_err(handle_starknet_command_error);
+
+    Ok(process_command_result("get nonce", result, ui, None))
+}
+
+#[expect(clippy::result_large_err)]
+pub async fn get_nonce(
+    provider: &JsonRpcClient<HttpTransport>,
+    contract_address: Felt,
+    block_id: BlockId,
+) -> Result<NonceResponse, StarknetCommandError> {
+    let nonce = provider
+        .get_nonce(block_id, contract_address)
+        .await
+        .map_err(|err| StarknetCommandError::ProviderError(err.into()))?;
+    Ok(NonceResponse { nonce })
+}

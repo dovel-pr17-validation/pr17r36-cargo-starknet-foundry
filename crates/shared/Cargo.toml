@@ -1,0 +1,32 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+starknet_api.workspace = true
+anyhow.workspace = true
+camino.workspace = true
+starknet-types-core.workspace = true
+console.workspace = true
+semver.workspace = true
+starknet-rust.workspace = true
+url.workspace = true
+regex.workspace = true
+snapbox.workspace = true
+indicatif.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+cairo-vm.workspace = true
+num-traits.workspace = true
+foundry-ui ={ path = "../foundry-ui" }
+thiserror = "2.0.17"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+testing = []

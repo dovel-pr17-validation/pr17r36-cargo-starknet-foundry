@@ -1,0 +1,175 @@
+use crate::helpers::constants::{
+    DEVNET_OZ_CLASS_HASH_CAIRO_0, DEVNET_PREDEPLOYED_ACCOUNT_ADDRESS, URL,
+};
+use crate::helpers::fixtures::create_test_provider;
+
+use camino::Utf8PathBuf;
+use shared::rpc::{get_rpc_version, is_expected_version};
+use sncast::helpers::configuration::CastConfig;
+use sncast::helpers::rpc::RpcArgs;
+use sncast::response::ui::UI;
+use sncast::{check_if_legacy_contract, get_account, get_provider};
+use starknet_rust::macros::felt;
+use url::Url;
+
+#[tokio::test]
+async fn test_get_provider() {
+    let provider = get_provider(&Url::parse(URL).unwrap());
+    assert!(provider.is_ok());
+}
+
+#[tokio::test]
+async fn test_get_account() {
+    let provider = create_test_provider();
+    let config = CastConfig {
+        account: "user1".to_string(),
+        accounts_file: Utf8PathBuf::from("tests/data/accounts/accounts.json"),
+        ..Default::default()
+    };
+    let rpc_args = RpcArgs {
+        url: Some(Url::parse(URL).expect("Failed to parse URL")),
+        network: None,
+    };
+    let account = get_account(&config, &provider, &rpc_args, &UI::default())
+        .await
+        .unwrap();
+
+    assert_eq!(account.chain_id(), felt!("0x534e5f5345504f4c4941"));
+    assert_eq!(
+        account.address(),
+        felt!("0xf6ecd22832b7c3713cfa7826ee309ce96a2769833f093795fafa1b8f20c48b")
+    );
+}
+
+#[tokio::test]
+async fn test_get_account_no_file() {
+    let provider = create_test_provider();
+    let config = CastConfig {
+        account: "user1".to_string(),
+        accounts_file: Utf8PathBuf::from("tests/data/accounts/nonexistentfile.json"),
+        ..Default::default()
+    };
+    let rpc_args = RpcArgs {
+        url: Some(Url::parse(URL).expect("Failed to parse URL")),
+        network: None,
+    };
+    let account = get_account(&config, &provider, &rpc_args, &UI::default()).await;
+    let err = account.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Accounts file = tests/data/accounts/nonexistentfile.json does not exist!")
+    );
+}
+
+#[tokio::test]
+async fn test_get_account_invalid_file() {
+    let provider = create_test_provider();
+    let config = CastConfig {
+        account: "user1".to_string(),
+        accounts_file: Utf8PathBuf::from("tests/data/accounts/invalid_format.json"),
+        ..Default::default()
+    };
+    let rpc_args = RpcArgs {
+        url: Some(Url::parse(URL).expect("Failed to parse URL")),
+        network: None,
+    };
+    let account = get_account(&config, &provider, &rpc_args, &UI::default()).await;
+    let err = account.unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("Failed to parse field `alpha-sepolia.?` in file 'tests/data/accounts/invalid_format.json': expected `,` or `}` at line 8 column 9")
+    );
+}
+
+#[tokio::test]
+async fn test_get_account_no_account() {
+    let provider = create_test_provider();
+    let config = CastConfig {
+        account: String::new(),
+        accounts_file: Utf8PathBuf::from("tests/data/accounts/accounts.json"),
+        ..Default::default()
+    };
+    let rpc_args = RpcArgs {
+        url: Some(Url::parse(URL).expect("Failed to parse URL")),
+        network: None,
+    };
+    let account = get_account(&config, &provider, &rpc_args, &UI::default()).await;
+    let err = account.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Account name not passed nor found in snfoundry.toml")
+    );
+}
+
+#[tokio::test]
+async fn test_get_account_no_user_for_network() {
+    let provider = create_test_provider();
+    let config = CastConfig {
+        account: "user100".to_string(),
+        accounts_file: Utf8PathBuf::from("tests/data/accounts/accounts.json"),
+        ..Default::default()
+    };
+    let rpc_args = RpcArgs {
+        url: Some(Url::parse(URL).expect("Failed to parse URL")),
+        network: None,
+    };
+    let account = get_account(&config, &provider, &rpc_args, &UI::default()).await;
+    let err = account.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Account = user100 not found under network = alpha-sepolia")
+    );
+}
+
+#[tokio::test]
+async fn test_get_account_failed_to_convert_field_elements() {
+    let provider = create_test_provider();
+    let config = CastConfig {
+        account: "with_invalid_private_key".to_string(),
+        accounts_file: Utf8PathBuf::from("tests/data/accounts/faulty_accounts_invalid_felt.json"),
+        ..Default::default()
+    };
+    let rpc_args = RpcArgs {
+        url: Some(Url::parse(URL).expect("Failed to parse URL")),
+        network: None,
+    };
+    let account1 = get_account(&config, &provider, &rpc_args, &UI::default()).await;
+    let err = account1.unwrap_err();
+
+    assert!(err.to_string().contains(
+        "Failed to parse field `alpha-sepolia.with_invalid_private_key` in file 'tests/data/accounts/faulty_accounts_invalid_felt.json': data did not match any variant of untagged enum SignerType at line 9 column 9"
+    ));
+}
+
+// TODO (#1690): Move this test to the shared crate and execute it for a real node
+#[tokio::test]
+async fn test_supported_rpc_version_matches_devnet_version() {
+    let provider = create_test_provider();
+    let devnet_spec_version = get_rpc_version(&provider).await.unwrap();
+    assert!(is_expected_version(&devnet_spec_version));
+}
+
+#[tokio::test]
+async fn test_check_if_legacy_contract_by_class_hash() {
+    let provider = create_test_provider();
+    let class_hash = DEVNET_OZ_CLASS_HASH_CAIRO_0
+        .parse()
+        .expect("Failed to parse DEVNET_OZ_CLASS_HASH_CAIRO_0");
+    let mock_address = "0x1".parse().unwrap();
+    let is_legacy = check_if_legacy_contract(Some(class_hash), mock_address, &provider)
+        .await
+        .unwrap();
+    assert!(is_legacy);
+}
+
+#[tokio::test]
+async fn test_check_if_legacy_contract_by_address() {
+    let provider = create_test_provider();
+    let address = DEVNET_PREDEPLOYED_ACCOUNT_ADDRESS
+        .parse()
+        .expect("Failed to parse DEVNET_PREDEPLOYED_ACCOUNT_ADDRESS");
+    let is_legacy = check_if_legacy_contract(None, address, &provider)
+        .await
+        .unwrap();
+    assert!(!is_legacy);
+}

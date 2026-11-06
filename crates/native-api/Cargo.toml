@@ -1,0 +1,13 @@
+[package]
+name = "native-api"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+starknet_api.workspace = true
+cairo-lang-starknet-classes.workspace = true
+cairo-native.workspace = true

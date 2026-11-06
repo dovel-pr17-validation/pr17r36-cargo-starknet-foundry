@@ -1,0 +1,93 @@
+# Fuzz Testing
+
+In many cases, a test needs to verify function behavior for multiple possible values.
+While it is possible to come up with these cases on your own, it is often impractical, especially when you want to test
+against a large number of possible arguments.
+
+> ℹ️ **Info**
+> Currently, `snforge` fuzzer only supports using randomly generated values.
+> This way of fuzzing doesn't support any kind of value generation based on code analysis, test coverage or results of
+> other fuzzer runs.
+> In the future, more advanced fuzzing execution modes will be added.
+
+## Random Fuzzing
+
+To convert a standard test into a random fuzz test, you need to add parameters to the test function
+and include the [`#[fuzzer]`](../testing/test-attributes.md#fuzzer) attribute.
+These arguments can then be used in the test body.
+The test will be run many times against different randomly generated values.
+
+```rust
+{{#include ../../listings/fuzz_testing/src/basic_example.cairo}}
+```
+
+Then run `snforge test` like usual.
+
+```shell
+$ snforge test
+```
+
+<details>
+<summary>Output:</summary>
+
+<!-- TODO (#2926) -->
+```shell
+Collected 2 test(s) from fuzz_testing package
+Running 2 test(s) from src/
+[PASS] fuzz_testing::with_parameters::tests::test_sum (runs: 22, (l1_gas: {max: ~0, min: ~0, mean: ~0, std deviation: ~0}, l1_data_gas: {max: ~0, min: ~0, mean: ~0, std deviation: ~0}, l2_gas: {max: ~1888390, min: ~1852630, mean: ~1881888, std deviation: ~9322}))
+[PASS] fuzz_testing::basic_example::tests::test_sum (runs: 256, (l1_gas: {max: ~0, min: ~0, mean: ~0, std deviation: ~0}, l1_data_gas: {max: ~0, min: ~0, mean: ~0, std deviation: ~0}, l2_gas: {max: ~1888390, min: ~1828790, mean: ~1882058, std deviation: ~8807}))
+Tests: 2 passed, 0 failed, 0 ignored, 0 filtered out
+Fuzzer seed: [..]
+```
+</details>
+<br>
+
+## Types Supported by the Fuzzer
+
+Fuzzer currently supports generating values for these types out of the box:
+
+- `felt252`
+- `u8`, `u16`, `u32`, `u64`, `u128`, `u256`
+- `i8`, `i16`, `i32`, `i64`, `i128`
+- `ByteArray`
+
+To use other types, you can either derive or manually implement the [`Fuzzable`](../appendix/snforge-library/fuzzable.md) trait.
+Providing non-fuzzable types will result in a compilation error.
+
+### Deriving `Fuzzable`
+
+For structs and enums whose fields already implement `Fuzzable`, you can use `#[derive(Fuzzable)]` to generate the implementation automatically:
+
+```rust
+{{#include ../../listings/fuzz_testing/src/derive_fuzzable.cairo}}
+```
+
+The macro requires all field/variant types to implement `Fuzzable`. For generic types, it automatically adds the `+snforge_std::fuzzable::Fuzzable<T>` and `+core::fmt::Debug<T>` constraints for each type parameter.
+
+### Manual `Fuzzable` Implementation
+
+For types that need custom fuzzing logic, implement the trait manually — see the [Fuzzable](../appendix/snforge-library/fuzzable.md) appendix for details.
+
+## Fuzzer Configuration
+
+It is possible to configure the number of runs of the random fuzzer as well as its seed for a specific test case:
+
+```rust
+{{#include ../../listings/fuzz_testing/src/with_parameters.cairo}}
+```
+
+It can also be configured globally, via command line arguments:
+
+```shell
+$ snforge test --fuzzer-runs 1234 --fuzzer-seed 1111
+```
+
+Or in `Scarb.toml` file:
+
+```toml
+# ...
+[tool.snforge]
+fuzzer_runs = 1234
+fuzzer_seed = 1111
+# ...
+```

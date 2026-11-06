@@ -1,0 +1,11 @@
+[package]
+name = "package1"
+version.workspace = true
+edition = "2024_07"
+
+[dependencies]
+starknet.workspace = true
+
+[[target.starknet-contract]]
+
+[lib]

@@ -1,0 +1,214 @@
+use crate::starknet_commands::utils::felt_or_id::{ContractAddress, TokenAddress};
+use anyhow::{Context, Error, Result, bail};
+use clap::Args;
+use primitive_types::U256;
+use sncast::helpers::command::process_command_result;
+use sncast::helpers::configuration::CastConfig;
+use sncast::helpers::rpc::RpcArgs;
+use sncast::helpers::token::Token;
+use sncast::response::errors::{StarknetCommandError, handle_starknet_command_error};
+use sncast::response::get::balance::BalanceResponse;
+use sncast::response::ui::UI;
+use sncast::{get_account, get_account_data_from_accounts_file, get_block_id, get_chain_id};
+use starknet_rust::{
+    core::{types::FunctionCall, utils::get_selector_from_name},
+    providers::{JsonRpcClient, Provider, jsonrpc::HttpTransport},
+};
+use starknet_types_core::felt::Felt;
+use std::process::ExitCode;
+
+#[derive(Args, Debug, Clone)]
+#[group(multiple = false)]
+pub struct TokenIdentifier {
+    /// Symbol of the token to check the balance for.
+    /// Supported tokens are: strk, eth.
+    /// Defaults to strk.
+    #[arg(value_enum, short = 't', long)]
+    pub token: Option<Token>,
+
+    /// Token contract address to check the balance for (hex, decimal, or @alias from snfoundry.toml).
+    /// Token needs to be compatible with ERC-20 standard.
+    #[arg(short = 'd', long)]
+    pub token_address: Option<TokenAddress>,
+}
+
+impl TokenIdentifier {
+    pub fn contract_address(&self, config: &CastConfig) -> Result<Felt> {
+        if let Some(addr) = &self.token_address {
+            addr.resolve(config)
+        } else if let Some(tok) = self.token {
+            Ok(tok.contract_address())
+        } else {
+            // Both token and token address are optional, hence we cannot have
+            // default value for token at clap level.
+            Ok(Token::default().contract_address())
+        }
+    }
+
+    pub fn token_suffix(&self) -> Option<Token> {
+        match (self.token, self.token_address.as_ref()) {
+            (Some(token), None) => Some(token),
+            (None, Some(_)) => None,
+            (None, None) => Some(Token::default()),
+            (Some(_), Some(_)) => unreachable!(
+                "Clap should ensure that only one of `--token` or `--token-address` is provided"
+            ),
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+#[command(about = "Fetch balance of the account for specified token")]
+pub struct Balance {
+    #[command(flatten)]
+    pub token_identifier: TokenIdentifier,
+
+    /// Contract address to check balance for (hex, decimal, or @alias from snfoundry.toml).
+    #[arg(long)]
+    pub contract_address: Option<ContractAddress>,
+
+    /// Block identifier on which balance should be fetched.
+    /// Possible values: `pre_confirmed`, `latest`, block hash (0x prefixed string)
+    /// and block number (u64)
+    #[arg(short, long, default_value = "pre_confirmed")]
+    pub block_id: String,
+
+    #[command(flatten)]
+    pub rpc: RpcArgs,
+}
+
+pub async fn balance(balance: Balance, config: CastConfig, ui: &UI) -> anyhow::Result<ExitCode> {
+    if balance.contract_address.is_some() && !config.account.is_empty() {
+        bail!("`--account` and `--contract-address` cannot be used together");
+    }
+
+    let provider = balance.rpc.get_provider(&config, ui).await?;
+    let account_address = match &balance.contract_address {
+        Some(contract_address) => contract_address.resolve(&config)?,
+        None => get_account_address(&config, &provider, &balance.rpc, ui).await?,
+    };
+
+    let result = get_balance(account_address, &provider, &balance, &config)
+        .await
+        .map_err(handle_starknet_command_error);
+
+    Ok(process_command_result("get balance", result, ui, None))
+}
+
+async fn get_account_address(
+    config: &CastConfig,
+    provider: &JsonRpcClient<HttpTransport>,
+    rpc_args: &RpcArgs,
+    ui: &UI,
+) -> anyhow::Result<Felt> {
+    if config.keystore.is_some() || sncast::helpers::account::is_devnet_account(&config.account) {
+        return Ok(get_account(config, provider, rpc_args, ui).await?.address());
+    }
+
+    let chain_id = get_chain_id(provider).await?;
+    let account_data =
+        get_account_data_from_accounts_file(&config.account, chain_id, &config.accounts_file)?;
+
+    account_data
+        .address
+        .context("Failed to get account address")
+}
+
+#[expect(clippy::result_large_err)]
+pub async fn get_balance(
+    account_address: Felt,
+    provider: &JsonRpcClient<HttpTransport>,
+    balance: &Balance,
+    config: &CastConfig,
+) -> Result<BalanceResponse, StarknetCommandError> {
+    let token_contract_address = balance
+        .token_identifier
+        .contract_address(config)
+        .map_err(StarknetCommandError::from)?;
+
+    let call = FunctionCall {
+        contract_address: token_contract_address,
+        entry_point_selector: get_selector_from_name("balance_of").expect("Failed to get selector"),
+        calldata: vec![account_address],
+    };
+    let block_id = get_block_id(&balance.block_id)?;
+
+    let res = provider
+        .call(call, block_id)
+        .await
+        .map_err(|err| StarknetCommandError::ProviderError(err.into()))?;
+
+    let token_unit = balance
+        .token_identifier
+        .token_suffix()
+        .map(|token| token.as_token_unit());
+
+    let balance = erc20_balance_to_u256(&res).map_err(StarknetCommandError::from)?;
+
+    Ok(BalanceResponse {
+        balance,
+        token_unit,
+    })
+}
+
+fn erc20_balance_to_u256(balance: &[Felt]) -> Result<U256, Error> {
+    if balance.len() != 2 {
+        return Err(anyhow::anyhow!(
+            "Balance response should contain exactly two values"
+        ));
+    }
+
+    let low: u128 = balance[0].try_into()?;
+    let high: u128 = balance[1].try_into()?;
+
+    let mut bytes = [0u8; 32];
+    bytes[0..16].copy_from_slice(&low.to_le_bytes());
+    bytes[16..32].copy_from_slice(&high.to_le_bytes());
+
+    Ok(U256::from_little_endian(&bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use primitive_types::U256;
+    use starknet_rust::macros::felt;
+    use starknet_types_core::felt::Felt;
+
+    #[test]
+    fn test_happy_case() {
+        let balance = vec![
+            Felt::from_hex("0x1").unwrap(),
+            Felt::from_hex("0x0").unwrap(),
+        ];
+        let result = erc20_balance_to_u256(&balance).unwrap();
+        assert_eq!(result, U256::from(1u64));
+
+        let balance = vec![
+            Felt::from_hex("0xFFFFFFFFFFFFFFFF").unwrap(),
+            Felt::from_hex("0x2").unwrap(),
+        ];
+        let result = erc20_balance_to_u256(&balance).unwrap();
+        let expected = U256::from_dec_str("680564733841876926945195958937245974527").unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_invalid_length() {
+        let balance = vec![felt!("0x1"), felt!("0x0"), felt!("0x0")];
+        let err = erc20_balance_to_u256(&balance).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Balance response should contain exactly two values"),
+            "Unexpected error: {err}"
+        );
+
+        let balance = vec![Felt::from_hex("0x1").unwrap()];
+        let err = erc20_balance_to_u256(&balance).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Balance response should contain exactly two values"),
+            "Unexpected error: {err}"
+        );
+    }
+}

@@ -1,0 +1,427 @@
+use crate::e2e::common::runner::setup_package_at_path;
+use camino::Utf8PathBuf;
+use indoc::{formatdoc, indoc};
+use scarb_api::ScarbCommand;
+use shared::test_utils::output_assert::{assert_stdout_contains, case_assert_stdout_contains};
+use snapbox::cmd::Command as SnapboxCommand;
+use std::fs;
+
+#[test]
+#[cfg_attr(
+    feature = "scheduled_latest_scarb_only",
+    ignore = "Only passes with the latest Scarb"
+)]
+#[allow(clippy::too_many_lines)]
+fn syntax() {
+    let temp = setup_package_at_path(Utf8PathBuf::from("diagnostics/syntax"));
+    let output = SnapboxCommand::from_std(
+        ScarbCommand::new()
+            .current_dir(temp.path())
+            .args(["build", "--test"])
+            .command(),
+    )
+    .assert()
+    .failure();
+
+    assert_stdout_contains(
+        output,
+        indoc! {r#"
+        error[E1001]: Missing token ';'.
+         --> [..]/tests/contract.cairo:14:70
+            let (contract_address, _) = contract.deploy(constructor_calldata),unwrap();
+                                                                             ^
+        
+        error[E1000]: Skipped tokens. Expected: statement.
+         --> [..]/tests/contract.cairo:14:70
+            let (contract_address, _) = contract.deploy(constructor_calldata),unwrap();
+                                                                             ^
+        
+        error[E1001]: Missing token ';'.
+         --> [..]/tests/contract.cairo:14:70
+            let (contract_address, _) = contract.deploy(constructor_calldata),unwrap();
+                                                                             ^
+        note: this error originates in the attribute macro: `test`
+        
+        error[E1000]: Skipped tokens. Expected: statement.
+         --> [..]/tests/contract.cairo:14:70
+            let (contract_address, _) = contract.deploy(constructor_calldata),unwrap();
+                                                                             ^
+        note: this error originates in the attribute macro: `test`
+        
+        error[E1001]: Missing token ';'.
+         --> [..]/tests/contract.cairo:14:70
+            let (contract_address, _) = contract.deploy(constructor_calldata),unwrap();
+                                                                             ^
+        note: this error originates in the attribute macro: `test`
+        note: this error originates in the attribute macro: `fuzzer`
+        
+        error[E1000]: Skipped tokens. Expected: statement.
+         --> [..]/tests/contract.cairo:14:70
+            let (contract_address, _) = contract.deploy(constructor_calldata),unwrap();
+                                                                             ^
+        note: this error originates in the attribute macro: `test`
+        note: this error originates in the attribute macro: `fuzzer`
+        
+        error[E1001]: Missing token ';'.
+         --> [..]/tests/contract.cairo:14:70
+            let (contract_address, _) = contract.deploy(constructor_calldata),unwrap();
+                                                                             ^
+        note: this error originates in the attribute macro: `test`
+        note: this error originates in the attribute macro: `fuzzer`
+        note: this error originates in the attribute macro: `fork`
+        
+        error[E1000]: Skipped tokens. Expected: statement.
+         --> [..]/tests/contract.cairo:14:70
+            let (contract_address, _) = contract.deploy(constructor_calldata),unwrap();
+                                                                             ^
+        note: this error originates in the attribute macro: `test`
+        note: this error originates in the attribute macro: `fuzzer`
+        note: this error originates in the attribute macro: `fork`
+        
+        error[E2103]: Mismatched types: pattern cannot match against type "Result::<(starknet::contract_address::ContractAddress, Span::<felt252>), Array::<felt252>>".
+         --> [..]/tests/contract.cairo:14:9
+            let (contract_address, _) = contract.deploy(constructor_calldata),unwrap();
+                ^^^^^^^^^^^^^^^^^^^^^
+        note: this error originates in the attribute macro: `test`
+        note: this error originates in the attribute macro: `fuzzer`
+        note: this error originates in the attribute macro: `fork`
+        
+        error[E0006]: Function not found.
+         --> [..]/tests/contract.cairo:14:71
+            let (contract_address, _) = contract.deploy(constructor_calldata),unwrap();
+                                                                              ^^^^^^
+        note: this error originates in the attribute macro: `test`
+        note: this error originates in the attribute macro: `fuzzer`
+        note: this error originates in the attribute macro: `fork`
+        
+        error: could not compile `syntax_integrationtest` due to 10 previous errors and 1 warning
+    "#},
+    );
+}
+
+#[test]
+fn semantic() {
+    let temp = setup_package_at_path(Utf8PathBuf::from("diagnostics/semantic"));
+    let output = SnapboxCommand::from_std(
+        ScarbCommand::new()
+            .current_dir(temp.path())
+            .args(["build", "--test"])
+            .command(),
+    )
+    .assert()
+    .failure();
+
+    assert_stdout_contains(
+        output,
+        indoc! {r"
+        error[E0006]: Identifier not found.
+         --> [..]/tests/contract.cairo:21:13
+            let y = x;
+                    ^
+        note: this error originates in the attribute macro: `test`
+        note: this error originates in the attribute macro: `fuzzer`
+        note: this error originates in the attribute macro: `__fuzzer_config`
+        note: this error originates in the attribute macro: `__fuzzer_wrapper`
+        note: this error originates in the attribute macro: `fork`
+        note: this error originates in the attribute macro: `ignore`
+        note: this error originates in the attribute macro: `__internal_config_statement`
+        
+        warn[E0001]: Unused variable. Consider ignoring by prefixing with `_`.
+         --> [..]/tests/contract.cairo:21:9
+            let y = x;
+                ^
+        note: this error originates in the attribute macro: `test`
+        note: this error originates in the attribute macro: `fuzzer`
+        note: this error originates in the attribute macro: `__fuzzer_config`
+        note: this error originates in the attribute macro: `__fuzzer_wrapper`
+        note: this error originates in the attribute macro: `fork`
+        note: this error originates in the attribute macro: `ignore`
+        note: this error originates in the attribute macro: `__internal_config_statement`
+        
+        error: could not compile `semantic_integrationtest` due to 1 previous error and 2 warnings
+        "},
+    );
+}
+
+#[test]
+fn parameters() {
+    let temp = setup_package_at_path(Utf8PathBuf::from("diagnostics/parameters"));
+    let output = SnapboxCommand::from_std(
+        ScarbCommand::new()
+            .current_dir(temp.path())
+            .args(["build", "--test"])
+            .command(),
+    )
+    .assert()
+    .failure();
+
+    assert_stdout_contains(
+        output,
+        indoc! {"
+        error[E1001]: Missing token ','.
+         --> [..]/tests/contract.cairo:9:31
+        fn call_and_invoke(_a: felt252; b: u256) {
+                                      ^
+        
+        error[E1000]: Skipped tokens. Expected: parameter.
+         --> [..]/tests/contract.cairo:9:31
+        fn call_and_invoke(_a: felt252; b: u256) {
+                                      ^
+        
+        error[E1001]: Missing token ','.
+         --> [..]/tests/contract.cairo:9:31
+        fn call_and_invoke(_a: felt252; b: u256) {
+                                      ^
+        note: this error originates in the attribute macro: `test`
+        
+        error[E1000]: Skipped tokens. Expected: parameter.
+         --> [..]/tests/contract.cairo:9:31
+        fn call_and_invoke(_a: felt252; b: u256) {
+                                      ^^
+        note: this error originates in the attribute macro: `test`
+        
+        error: could not compile `parameters_integrationtest` due to 4 previous errors and 1 warning
+    "},
+    );
+}
+
+#[test]
+fn multiple() {
+    let temp = setup_package_at_path(Utf8PathBuf::from("diagnostics/multiple"));
+    let output = SnapboxCommand::from_std(
+        ScarbCommand::new()
+            .current_dir(temp.path())
+            .args(["build", "--test"])
+            .command(),
+    )
+    .assert()
+    .failure();
+
+    assert_stdout_contains(
+        output,
+        indoc! {"
+        error[E1002]: Missing tokens. Expected an expression.
+         --> [..]/tests/contract.cairo:19:22
+            assert(balance === 0, 'balance == 0');
+                             ^
+        
+        error[E1002]: Missing tokens. Expected an expression.
+         --> [..]/tests/contract.cairo:19:22
+            assert(balance === 0, 'balance == 0');
+                             ^
+        note: this error originates in the attribute macro: `test`
+        
+        error[E1002]: Missing tokens. Expected an expression.
+         --> [..]/tests/contract.cairo:19:22
+            assert(balance === 0, 'balance == 0');
+                             ^
+        note: this error originates in the attribute macro: `test`
+        note: this error originates in the attribute macro: `fuzzer`
+        
+        error[E1002]: Missing tokens. Expected an expression.
+         --> [..]/tests/contract.cairo:19:22
+            assert(balance === 0, 'balance == 0');
+                             ^
+        note: this error originates in the attribute macro: `test`
+        note: this error originates in the attribute macro: `fuzzer`
+        note: this error originates in the attribute macro: `fork`
+
+        error[E2000]: Unsupported feature.
+         --> [..]/tests/contract.cairo:19:22
+            assert(balance === 0, 'balance == 0');
+                             ^
+        note: this error originates in the attribute macro: `test`
+        note: this error originates in the attribute macro: `fuzzer`
+        note: this error originates in the attribute macro: `fork`
+        
+        error[E2084]: Invalid left-hand side of assignment.
+         --> [..]/tests/contract.cairo:19:12
+            assert(balance === 0, 'balance == 0');
+                   ^^^^^^^^^^
+        note: this error originates in the attribute macro: `test`
+        note: this error originates in the attribute macro: `fuzzer`
+        note: this error originates in the attribute macro: `fork`
+        
+        error[E0006]: Function not found.
+         --> [..]/tests/contract.cairo:57:30
+            let balance = dispatcher/get_balance();
+                                     ^^^^^^^^^^^
+        note: this error originates in the attribute macro: `test`
+        note: this error originates in the attribute macro: `fuzzer`
+        note: this error originates in the attribute macro: `__fuzzer_config`
+        note: this error originates in the attribute macro: `__fuzzer_wrapper`
+        note: this error originates in the attribute macro: `fork`
+        note: this error originates in the attribute macro: `ignore`
+        note: this error originates in the attribute macro: `__internal_config_statement`
+        
+        error: could not compile `multiple_integrationtest` due to 7 previous errors and 1 warning
+    "},
+    );
+}
+
+#[test]
+fn generic() {
+    let temp = setup_package_at_path(Utf8PathBuf::from("diagnostics/generic"));
+    let output = SnapboxCommand::from_std(
+        ScarbCommand::new()
+            .current_dir(temp.path())
+            .args(["build", "--test"])
+            .command(),
+    )
+    .assert()
+    .failure();
+
+    assert_stdout_contains(
+        output,
+        indoc! {r"
+        error[E2315]: Mismatched types. The type `[..]MyStruct` cannot be created from a numeric literal.
+         --> [..]/tests/contract.cairo:30:18
+            assert!(s == 3);
+                         ^
+        note: this error originates in the attribute macro: `test`
+        note: this error originates in the attribute macro: `fuzzer`
+        note: this error originates in the attribute macro: `__fuzzer_config`
+        note: this error originates in the attribute macro: `__fuzzer_wrapper`
+        note: this error originates in the attribute macro: `fork`
+        note: this error originates in the attribute macro: `ignore`
+        note: this error originates in the attribute macro: `__internal_config_statement`
+        
+        error: could not compile `generic_integrationtest` due to 1 previous error and 1 warning
+    "},
+    );
+}
+
+#[test]
+fn inline_macros() {
+    let temp = setup_package_at_path(Utf8PathBuf::from("diagnostics/inline_macros"));
+    let output = SnapboxCommand::from_std(
+        ScarbCommand::new()
+            .current_dir(temp.path())
+            .args(["build", "--test"])
+            .command(),
+    )
+    .assert()
+    .failure();
+
+    assert_stdout_contains(
+        output,
+        indoc! {r"
+        error[E2200]: Plugin diagnostic: Macro cannot be parsed as legacy macro. Expected an argument list wrapped in either parentheses, brackets, or braces.
+         --> [..]/tests/contract.cairo:23:5
+            print!('balance {}'; balance);
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        note: this error originates in the attribute macro: `test`
+        note: this error originates in the attribute macro: `fuzzer`
+        note: this error originates in the attribute macro: `__fuzzer_config`
+        note: this error originates in the attribute macro: `__fuzzer_wrapper`
+        note: this error originates in the attribute macro: `fork`
+        note: this error originates in the attribute macro: `ignore`
+        note: this error originates in the attribute macro: `__internal_config_statement`
+        
+        error: could not compile `inline_macros_integrationtest` due to 1 previous error and 1 warning
+    "},
+    );
+}
+
+#[test]
+fn different_attributes() {
+    fn generate_attributes() -> impl Iterator<Item = String> {
+        let attributes = vec![
+            "#[fuzzer]".to_string(),
+            r#"#[fork(url: "http://127.0.0.1:3030", block_tag: latest)]"#.to_string(),
+            "#[ignore]".to_string(),
+            "#[available_gas(l1_gas: 100, l2_gas: 200, l1_data_gas)]".to_string(),
+            "#[should_panic(expected: 'panic message')]".to_string(),
+        ];
+        attributes.into_iter()
+    }
+
+    for attribute in generate_attributes() {
+        let temp = setup_package_at_path(Utf8PathBuf::from("diagnostics/attributes"));
+        let test_file = temp.join("tests/contract.cairo");
+
+        let test_file_contents = fs::read_to_string(&test_file).unwrap();
+        let test_file_contents = test_file_contents.replace("@attrs@", &attribute);
+        fs::write(&test_file, test_file_contents).unwrap();
+
+        let output = SnapboxCommand::new("scarb")
+            .current_dir(&temp)
+            .args(["build", "--test"])
+            .assert()
+            .failure();
+
+        case_assert_stdout_contains(
+            attribute.clone(),
+            output,
+            formatdoc! {r"
+            error[E1001]: Missing token ';'.
+             --> [..]/tests/contract.cairo:10:81
+                let (_contract_address1, _) = contract.deploy(constructor_calldata).unwrap()
+
+            error: could not compile `attributes_integrationtest` due to 1 previous error and 1 warning
+    "},
+        );
+    }
+}
+
+#[test]
+fn test_case() {
+    let temp = setup_package_at_path(Utf8PathBuf::from("diagnostics/test_case_attr"));
+    let output = SnapboxCommand::from_std(
+        ScarbCommand::new()
+            .current_dir(temp.path())
+            .args(["build", "--test"])
+            .command(),
+    )
+    .assert()
+    .failure();
+
+    assert_stdout_contains(
+        output,
+        indoc! {r"
+        error[E2200]: Plugin diagnostic: #[test_case] The function must have at least one parameter to use #[test_case] attribute
+         --> [..]/tests/basic.cairo:2:1
+        #[test_case(3, 4, 7)]
+        ^^^^^^^^^^^^^^^^^^^^^
+        note: this error originates in the attribute macro: `test`
+
+        error[E2200]: Plugin diagnostic: #[test_case] Expected 2 arguments, but got 3
+        #[test_case(3, 4, 7)]
+        ^^^^^^^^^^^^^^^^^^^^^
+        note: this error originates in the attribute macro: `test`
+
+        error[E2200]: Plugin diagnostic: #[test_case] Only string literals are allowed for 'name' argument.
+        #[test_case(name: array![1, 2, 3], 3, 4, 7)]
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        note: this error originates in the attribute macro: `test`
+
+        error: could not compile `test_case_attr_integrationtest` due to 3 previous errors and 1 warning
+    "},
+    );
+}
+
+#[test]
+fn declare_macro_invalid_module_path() {
+    let temp = setup_package_at_path(Utf8PathBuf::from("diagnostics/declare_invalid"));
+    let output = SnapboxCommand::from_std(
+        ScarbCommand::new()
+            .current_dir(temp.path())
+            .args(["build", "--test"])
+            .command(),
+    )
+    .assert()
+    .failure();
+
+    assert_stdout_contains(
+        output,
+        indoc! {r"
+        error[E0006]: Identifier not found.
+         --> [..]/tests/contract.cairo:5:5
+            declare!(nonexistent::MissingContract).unwrap();
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        note: this error originates in the attribute macro: `test`
+
+        error: could not compile `declare_invalid_integrationtest` due to 1 previous error
+    "},
+    );
+}

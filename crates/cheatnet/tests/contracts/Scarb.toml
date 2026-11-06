@@ -1,0 +1,11 @@
+[package]
+name = "cheatnet_testing_contracts"
+version = "0.1.0"
+edition = "2024_07"
+
+[[target.starknet-contract]]
+
+[dependencies]
+starknet = "2.4.0"
+
+[tool.snforge]

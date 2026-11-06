@@ -1,0 +1,990 @@
+use crate::shared_cache::FailedTestsCache;
+use anyhow::Result;
+use forge_runner::filtering::{
+    ExcludeReason, FilterResult, NameFilter, TestCaseFilter, TestCaseIsIgnored,
+};
+use forge_runner::package_tests::TestCase;
+use forge_runner::package_tests::with_config_resolved::{
+    TestCaseWithResolvedConfig, sanitize_test_case_name,
+};
+use forge_runner::partition::PartitionConfig;
+
+#[derive(Debug, PartialEq)]
+// Specifies what tests should be included
+pub struct TestsFilter {
+    // based on name
+    pub(crate) name_filter: NameFilter,
+    // based on `#[ignore]` attribute
+    ignored_filter: IgnoredFilter,
+    // based on `--rerun_failed` flag
+    last_failed_filter: bool,
+    // based on `--skip` flag
+    skip_filter: Vec<String>,
+
+    failed_tests_cache: FailedTestsCache,
+    pub(crate) partitioning_config: PartitionConfig,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum IgnoredFilter {
+    IncludeAll,
+    IgnoredOnly,
+    ExcludeIgnored,
+}
+
+impl TestsFilter {
+    #[must_use]
+    #[expect(clippy::fn_params_excessive_bools)]
+    #[expect(clippy::too_many_arguments)]
+    pub fn from_flags(
+        test_name_filter: Option<String>,
+        exact_match: bool,
+        skip: Vec<String>,
+        only_ignored: bool,
+        include_ignored: bool,
+        rerun_failed: bool,
+        failed_tests_cache: FailedTestsCache,
+        partitioning_config: PartitionConfig,
+    ) -> Self {
+        assert!(
+            !(only_ignored && include_ignored),
+            "Arguments only_ignored and include_ignored cannot be both true"
+        );
+
+        let ignored_filter = if include_ignored {
+            IgnoredFilter::IncludeAll
+        } else if only_ignored {
+            IgnoredFilter::IgnoredOnly
+        } else {
+            IgnoredFilter::ExcludeIgnored
+        };
+
+        Self {
+            name_filter: NameFilter::from_flags(test_name_filter, exact_match),
+            ignored_filter,
+            last_failed_filter: rerun_failed,
+            skip_filter: skip,
+            failed_tests_cache,
+            partitioning_config,
+        }
+    }
+
+    pub(crate) fn filter_tests(
+        &self,
+        test_cases: &mut Vec<TestCaseWithResolvedConfig>,
+    ) -> Result<()> {
+        test_cases.retain(|tc| self.name_filter.matches(&tc.name));
+
+        if self.last_failed_filter {
+            match self.failed_tests_cache.load()?.as_slice() {
+                [] => {}
+                result => {
+                    test_cases.retain(|tc| result.iter().any(|name| name == &tc.name));
+                }
+            }
+        }
+
+        match self.ignored_filter {
+            // if ExcludeIgnored (default) we filter ignored tests later and display them as ignored
+            IgnoredFilter::IncludeAll | IgnoredFilter::ExcludeIgnored => {}
+            IgnoredFilter::IgnoredOnly => {
+                test_cases.retain(|tc| tc.config.ignored);
+            }
+        }
+
+        if !self.skip_filter.is_empty() {
+            test_cases.retain(|tc| !self.skip_filter.iter().any(|s| tc.name.contains(s)));
+        }
+
+        Ok(())
+    }
+}
+
+impl TestCaseFilter for TestsFilter {
+    fn filter<T>(&self, test_case: &TestCase<T>) -> FilterResult
+    where
+        T: TestCaseIsIgnored,
+    {
+        // Order of filter checks matters, because we do not want to display a test as ignored if
+        // it was excluded due to partitioning.
+        let sanitized_test_case_name = sanitize_test_case_name(&test_case.name);
+        if !self
+            .partitioning_config
+            .is_in_partition(&sanitized_test_case_name)
+        {
+            return FilterResult::Excluded(ExcludeReason::ExcludedFromPartition);
+        }
+
+        let case_ignored = test_case.config.is_ignored();
+
+        match self.ignored_filter {
+            IgnoredFilter::IncludeAll => {}
+            IgnoredFilter::IgnoredOnly => {
+                if !case_ignored {
+                    return FilterResult::Excluded(ExcludeReason::Ignored);
+                }
+            }
+            IgnoredFilter::ExcludeIgnored => {
+                if case_ignored {
+                    return FilterResult::Excluded(ExcludeReason::Ignored);
+                }
+            }
+        }
+        FilterResult::Included
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::shared_cache::FailedTestsCache;
+    use crate::test_filter::TestsFilter;
+    use cairo_lang_sierra::program::Program;
+    use cairo_lang_sierra::program::ProgramArtifact;
+    use forge_runner::expected_result::ExpectedTestResult;
+    use forge_runner::package_tests::with_config_resolved::{
+        TestCaseResolvedConfig, TestCaseWithResolvedConfig, TestTargetWithResolvedConfig,
+    };
+    use forge_runner::package_tests::{TestDetails, TestTargetLocation};
+    use forge_runner::partition::PartitionConfig;
+    use std::sync::Arc;
+    use universal_sierra_compiler_api::compile_raw_sierra;
+
+    fn program_for_testing() -> ProgramArtifact {
+        ProgramArtifact {
+            program: Program {
+                type_declarations: vec![],
+                libfunc_declarations: vec![],
+                statements: vec![],
+                funcs: vec![],
+            },
+            debug_info: None,
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Arguments only_ignored and include_ignored cannot be both true")]
+    fn from_flags_only_ignored_and_include_ignored_both_true() {
+        let _ = TestsFilter::from_flags(
+            None,
+            false,
+            Vec::new(),
+            true,
+            true,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Argument test_name_filter cannot be None with exact_match")]
+    fn from_flags_exact_match_true_without_test_filter_name() {
+        let _ = TestsFilter::from_flags(
+            None,
+            true,
+            Vec::new(),
+            false,
+            false,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines)]
+    fn filtering_tests() {
+        let mocked_tests = TestTargetWithResolvedConfig {
+            sierra_program: program_for_testing(),
+            sierra_program_path: Arc::default(),
+            casm_program: Arc::new(
+                compile_raw_sierra(&serde_json::to_value(&program_for_testing().program).unwrap())
+                    .unwrap(),
+            ),
+            test_cases: vec![
+                TestCaseWithResolvedConfig {
+                    name: "crate1::do_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: false,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "crate2::run_other_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: true,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "outer::crate2::execute_next_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: true,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: false,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+            ],
+            tests_location: TestTargetLocation::Lib,
+        };
+
+        let tests_filter = TestsFilter::from_flags(
+            Some("do".to_string()),
+            false,
+            Vec::new(),
+            false,
+            false,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+
+        let mut filtered = mocked_tests.clone();
+
+        tests_filter.filter_tests(&mut filtered.test_cases).unwrap();
+
+        assert_eq!(
+            filtered.test_cases,
+            vec![TestCaseWithResolvedConfig {
+                name: "crate1::do_thing".to_string(),
+                test_details: TestDetails::default(),
+
+                config: TestCaseResolvedConfig {
+                    available_gas: None,
+                    ignored: false,
+                    expected_result: ExpectedTestResult::Success,
+                    fork_config: None,
+                    fuzzer_config: None,
+                    disable_predeployed_contracts: false,
+                },
+            },]
+        );
+
+        let tests_filter = TestsFilter::from_flags(
+            Some("te2::run".to_string()),
+            false,
+            Vec::new(),
+            false,
+            false,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+
+        let mut filtered = mocked_tests.clone();
+        tests_filter.filter_tests(&mut filtered.test_cases).unwrap();
+
+        assert_eq!(
+            filtered.test_cases,
+            vec![TestCaseWithResolvedConfig {
+                name: "crate2::run_other_thing".to_string(),
+                test_details: TestDetails::default(),
+
+                config: TestCaseResolvedConfig {
+                    available_gas: None,
+                    ignored: true,
+                    expected_result: ExpectedTestResult::Success,
+                    fork_config: None,
+                    fuzzer_config: None,
+                    disable_predeployed_contracts: false,
+                },
+            },]
+        );
+
+        let tests_filter = TestsFilter::from_flags(
+            Some("thing".to_string()),
+            false,
+            Vec::new(),
+            false,
+            false,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+
+        let mut filtered = mocked_tests.clone();
+        tests_filter.filter_tests(&mut filtered.test_cases).unwrap();
+
+        assert_eq!(
+            filtered.test_cases,
+            vec![
+                TestCaseWithResolvedConfig {
+                    name: "crate1::do_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: false,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "crate2::run_other_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: true,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "outer::crate2::execute_next_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: true,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: false,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+            ]
+        );
+
+        let tests_filter = TestsFilter::from_flags(
+            Some("nonexistent".to_string()),
+            false,
+            Vec::new(),
+            false,
+            false,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+
+        let mut filtered = mocked_tests.clone();
+        tests_filter.filter_tests(&mut filtered.test_cases).unwrap();
+
+        assert_eq!(filtered.test_cases, vec![]);
+
+        let tests_filter = TestsFilter::from_flags(
+            Some(String::new()),
+            false,
+            Vec::new(),
+            false,
+            false,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+
+        let mut filtered = mocked_tests.clone();
+        tests_filter.filter_tests(&mut filtered.test_cases).unwrap();
+
+        assert_eq!(
+            filtered.test_cases,
+            vec![
+                TestCaseWithResolvedConfig {
+                    name: "crate1::do_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: false,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "crate2::run_other_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: true,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "outer::crate2::execute_next_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: true,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: false,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn filtering_with_no_tests() {
+        let mocked_tests = TestTargetWithResolvedConfig {
+            sierra_program: program_for_testing(),
+            sierra_program_path: Arc::default(),
+            casm_program: Arc::new(
+                compile_raw_sierra(&serde_json::to_value(&program_for_testing().program).unwrap())
+                    .unwrap(),
+            ),
+            test_cases: vec![],
+            tests_location: TestTargetLocation::Lib,
+        };
+
+        let tests_filter = TestsFilter::from_flags(
+            Some(String::new()),
+            false,
+            Vec::new(),
+            false,
+            false,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+
+        let mut filtered = mocked_tests.clone();
+        tests_filter.filter_tests(&mut filtered.test_cases).unwrap();
+
+        assert_eq!(filtered.test_cases, vec![]);
+
+        let tests_filter = TestsFilter::from_flags(
+            Some("thing".to_string()),
+            false,
+            Vec::new(),
+            false,
+            false,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+
+        let mut filtered = mocked_tests.clone();
+        tests_filter.filter_tests(&mut filtered.test_cases).unwrap();
+
+        assert_eq!(filtered.test_cases, vec![]);
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines)]
+    fn filtering_with_exact_match() {
+        let mocked_tests = TestTargetWithResolvedConfig {
+            sierra_program: program_for_testing(),
+            sierra_program_path: Arc::default(),
+            casm_program: Arc::new(
+                compile_raw_sierra(&serde_json::to_value(&program_for_testing().program).unwrap())
+                    .unwrap(),
+            ),
+            test_cases: vec![
+                TestCaseWithResolvedConfig {
+                    name: "crate1::do_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: false,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "crate2::run_other_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: true,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "outer::crate3::run_other_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: true,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "do_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: false,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+            ],
+            tests_location: TestTargetLocation::Tests,
+        };
+
+        let tests_filter = TestsFilter::from_flags(
+            Some(String::new()),
+            true,
+            Vec::new(),
+            false,
+            false,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+
+        let mut filtered = mocked_tests.clone();
+        tests_filter.filter_tests(&mut filtered.test_cases).unwrap();
+
+        assert_eq!(filtered.test_cases, vec![]);
+
+        let tests_filter = TestsFilter::from_flags(
+            Some("thing".to_string()),
+            true,
+            Vec::new(),
+            false,
+            false,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+
+        let mut filtered = mocked_tests.clone();
+        tests_filter.filter_tests(&mut filtered.test_cases).unwrap();
+
+        assert_eq!(filtered.test_cases, vec![]);
+
+        let tests_filter = TestsFilter::from_flags(
+            Some("do_thing".to_string()),
+            true,
+            Vec::new(),
+            false,
+            false,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+
+        let mut filtered = mocked_tests.clone();
+        tests_filter.filter_tests(&mut filtered.test_cases).unwrap();
+
+        assert_eq!(
+            filtered.test_cases,
+            vec![TestCaseWithResolvedConfig {
+                name: "do_thing".to_string(),
+                test_details: TestDetails::default(),
+
+                config: TestCaseResolvedConfig {
+                    available_gas: None,
+                    ignored: false,
+                    expected_result: ExpectedTestResult::Success,
+                    fork_config: None,
+                    fuzzer_config: None,
+                    disable_predeployed_contracts: false,
+                },
+            },]
+        );
+
+        let tests_filter = TestsFilter::from_flags(
+            Some("crate1::do_thing".to_string()),
+            true,
+            Vec::new(),
+            false,
+            false,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+
+        let mut filtered = mocked_tests.clone();
+        tests_filter.filter_tests(&mut filtered.test_cases).unwrap();
+
+        assert_eq!(
+            filtered.test_cases,
+            vec![TestCaseWithResolvedConfig {
+                name: "crate1::do_thing".to_string(),
+                test_details: TestDetails::default(),
+
+                config: TestCaseResolvedConfig {
+                    available_gas: None,
+                    ignored: false,
+                    expected_result: ExpectedTestResult::Success,
+                    fork_config: None,
+                    fuzzer_config: None,
+                    disable_predeployed_contracts: false,
+                },
+            },]
+        );
+
+        let tests_filter = TestsFilter::from_flags(
+            Some("crate3::run_other_thing".to_string()),
+            true,
+            Vec::new(),
+            false,
+            false,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+
+        let mut filtered = mocked_tests.clone();
+        tests_filter.filter_tests(&mut filtered.test_cases).unwrap();
+
+        assert_eq!(filtered.test_cases, vec![]);
+
+        let tests_filter = TestsFilter::from_flags(
+            Some("outer::crate3::run_other_thing".to_string()),
+            true,
+            Vec::new(),
+            false,
+            false,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+
+        let mut filtered = mocked_tests.clone();
+        tests_filter.filter_tests(&mut filtered.test_cases).unwrap();
+
+        assert_eq!(
+            filtered.test_cases,
+            vec![TestCaseWithResolvedConfig {
+                name: "outer::crate3::run_other_thing".to_string(),
+                test_details: TestDetails::default(),
+
+                config: TestCaseResolvedConfig {
+                    available_gas: None,
+                    ignored: true,
+                    expected_result: ExpectedTestResult::Success,
+                    fork_config: None,
+                    fuzzer_config: None,
+                    disable_predeployed_contracts: false,
+                },
+            },]
+        );
+    }
+
+    #[test]
+    fn filtering_with_only_ignored() {
+        let mocked_tests = TestTargetWithResolvedConfig {
+            sierra_program: program_for_testing(),
+            sierra_program_path: Arc::default(),
+            casm_program: Arc::new(
+                compile_raw_sierra(&serde_json::to_value(&program_for_testing().program).unwrap())
+                    .unwrap(),
+            ),
+            test_cases: vec![
+                TestCaseWithResolvedConfig {
+                    name: "crate1::do_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: false,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "crate2::run_other_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: true,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "outer::crate3::run_other_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: true,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "do_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: false,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+            ],
+            tests_location: TestTargetLocation::Tests,
+        };
+
+        let tests_filter = TestsFilter::from_flags(
+            None,
+            false,
+            Vec::new(),
+            true,
+            false,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+        let mut filtered = mocked_tests;
+        tests_filter.filter_tests(&mut filtered.test_cases).unwrap();
+
+        assert_eq!(
+            filtered.test_cases,
+            vec![
+                TestCaseWithResolvedConfig {
+                    name: "crate2::run_other_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: true,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "outer::crate3::run_other_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: true,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines)]
+    fn filtering_with_include_ignored() {
+        let mocked_tests = TestTargetWithResolvedConfig {
+            sierra_program: program_for_testing(),
+            sierra_program_path: Arc::default(),
+            casm_program: Arc::new(
+                compile_raw_sierra(&serde_json::to_value(&program_for_testing().program).unwrap())
+                    .unwrap(),
+            ),
+            test_cases: vec![
+                TestCaseWithResolvedConfig {
+                    name: "crate1::do_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: false,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "crate2::run_other_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: true,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "outer::crate3::run_other_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: true,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "do_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: false,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+            ],
+            tests_location: TestTargetLocation::Tests,
+        };
+
+        let tests_filter = TestsFilter::from_flags(
+            None,
+            false,
+            Vec::new(),
+            false,
+            true,
+            false,
+            FailedTestsCache::default(),
+            PartitionConfig::default(),
+        );
+        let mut filtered = mocked_tests;
+        tests_filter.filter_tests(&mut filtered.test_cases).unwrap();
+
+        assert_eq!(
+            filtered.test_cases,
+            vec![
+                TestCaseWithResolvedConfig {
+                    name: "crate1::do_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: false,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "crate2::run_other_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: true,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "outer::crate3::run_other_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: true,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+                TestCaseWithResolvedConfig {
+                    name: "do_thing".to_string(),
+                    test_details: TestDetails::default(),
+
+                    config: TestCaseResolvedConfig {
+                        available_gas: None,
+                        ignored: false,
+                        expected_result: ExpectedTestResult::Success,
+                        fork_config: None,
+                        fuzzer_config: None,
+                        disable_predeployed_contracts: false,
+                    },
+                },
+            ]
+        );
+    }
+}

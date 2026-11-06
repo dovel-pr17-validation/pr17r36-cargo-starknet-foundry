@@ -1,0 +1,96 @@
+use crate::Network;
+use crate::helpers::{block_explorer::LinkProvider, configuration::CastConfig, devnet::detection};
+use foundry_ui::Message;
+use serde::Serialize;
+use serde_json::Value;
+use starknet_types_core::felt::Felt;
+
+const SNCAST_FORCE_SHOW_EXPLORER_LINKS_ENV: &str = "SNCAST_FORCE_SHOW_EXPLORER_LINKS";
+
+// TODO(#3391): This code should be refactored to either use common `Message` trait or be directly
+//  included in `sncast` output messages.
+pub trait OutputLink {
+    const TITLE: &'static str;
+
+    fn format_links(&self, provider: Box<dyn LinkProvider>) -> String;
+
+    fn is_dry_run(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Serialize)]
+pub struct ExplorerLinksMessage {
+    title: String,
+    links: String,
+}
+
+impl ExplorerLinksMessage {
+    pub fn new<T>(response: &T, provider: Box<dyn LinkProvider>) -> Self
+    where
+        T: OutputLink,
+    {
+        Self {
+            title: T::TITLE.to_string(),
+            links: response.format_links(provider),
+        }
+    }
+}
+
+impl Message for ExplorerLinksMessage {
+    fn text(&self) -> String {
+        format!("\nTo see {} details, visit:\n{}", self.title, self.links)
+    }
+
+    fn json(&self) -> Value {
+        // TODO(#3960) Fix JSON output support, currently links contain `\n` characters
+        serde_json::to_value(self).unwrap()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ExplorerError {
+    #[error("The chosen block explorer service is not available for Sepolia Network")]
+    SepoliaNotSupported,
+    #[error("Custom network is not recognized by block explorer service")]
+    UnrecognizedNetwork,
+    #[error("Block explorer service is not available for Devnet Network")]
+    DevnetNotSupported,
+}
+
+pub async fn block_explorer_link_if_allowed<T>(
+    result: &anyhow::Result<T>,
+    chain_id: Felt,
+    config: &CastConfig,
+) -> Option<ExplorerLinksMessage>
+where
+    T: OutputLink + Clone,
+{
+    let Ok(response) = result else {
+        return None;
+    };
+
+    if response.is_dry_run() {
+        return None;
+    }
+
+    let network = chain_id.try_into().ok()?;
+
+    let is_devnet = matches!(network, Network::Devnet) || detection::is_devnet_running().await;
+
+    if (!config.show_explorer_links || is_devnet) && !is_explorer_link_overridden() {
+        return None;
+    }
+
+    config
+        .block_explorer
+        .unwrap_or_default()
+        .as_provider(network)
+        .ok()
+        .map(|provider| ExplorerLinksMessage::new(response, provider))
+}
+
+#[must_use]
+pub fn is_explorer_link_overridden() -> bool {
+    std::env::var(SNCAST_FORCE_SHOW_EXPLORER_LINKS_ENV).is_ok_and(|value| value == "1")
+}

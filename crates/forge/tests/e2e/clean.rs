@@ -1,0 +1,421 @@
+use super::common::runner::{runner, setup_hello_workspace, setup_package, test_runner};
+use assert_fs::TempDir;
+use camino::Utf8PathBuf;
+use scarb_api::metadata::{MetadataOpts, metadata_with_opts};
+use shared::cache::{CACHEDIR_TAG_CONTENTS, CACHEDIR_TAG_FILENAME};
+use shared::cache::{DEFAULT_CACHE_DIR, USC_CACHE_DIR};
+use shared::test_utils::output_assert::assert_stdout_contains;
+use std::fs;
+use std::path::Path;
+
+const COVERAGE_DIR: &str = "coverage";
+const PROFILE_DIR: &str = "profile";
+const TRACE_DIR: &str = "snfoundry_trace";
+
+#[expect(clippy::struct_excessive_bools)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+struct CleanComponentsState {
+    coverage: bool,
+    profile: bool,
+    cache: bool,
+    trace: bool,
+}
+
+#[test]
+#[cfg_attr(
+    feature = "cairo-native",
+    ignore = "Native doesn't support coverage yet"
+)]
+fn test_clean_coverage() {
+    let temp_dir = setup_package("coverage_project");
+
+    let clean_components_state = CleanComponentsState {
+        coverage: true,
+        profile: false,
+        cache: true,
+        trace: true,
+    };
+
+    generate_clean_components(clean_components_state, &temp_dir);
+
+    runner(&temp_dir)
+        .arg("clean")
+        .arg("coverage")
+        .arg("trace")
+        .assert()
+        .success();
+
+    let expected_state = CleanComponentsState {
+        coverage: false,
+        profile: false,
+        cache: true,
+        trace: false,
+    };
+
+    assert_eq!(
+        check_clean_components_state(temp_dir.path()),
+        expected_state
+    );
+}
+
+#[test]
+#[cfg_attr(
+    feature = "cairo-native",
+    ignore = "Native doesn't support profiler yet"
+)]
+fn test_clean_profile() {
+    let temp_dir = setup_package("coverage_project");
+
+    let clean_components_state = CleanComponentsState {
+        coverage: false,
+        profile: true,
+        cache: true,
+        trace: true,
+    };
+
+    generate_clean_components(clean_components_state, &temp_dir);
+
+    runner(&temp_dir)
+        .arg("clean")
+        .arg("profile")
+        .assert()
+        .success();
+
+    let expected_state = CleanComponentsState {
+        coverage: false,
+        profile: false,
+        cache: true,
+        trace: true,
+    };
+
+    assert_eq!(
+        check_clean_components_state(temp_dir.path()),
+        expected_state
+    );
+}
+
+#[test]
+fn test_clean_cache() {
+    let temp_dir = setup_package("coverage_project");
+
+    let clean_components_state = CleanComponentsState {
+        coverage: false,
+        profile: false,
+        cache: true,
+        trace: false,
+    };
+
+    generate_clean_components(clean_components_state, &temp_dir);
+
+    runner(&temp_dir)
+        .arg("clean")
+        .arg("cache")
+        .assert()
+        .success();
+
+    let expected_state = CleanComponentsState {
+        coverage: false,
+        profile: false,
+        cache: false,
+        trace: false,
+    };
+
+    assert_eq!(
+        check_clean_components_state(temp_dir.path()),
+        expected_state
+    );
+}
+
+#[test]
+fn test_clean_cache_with_custom_cache_dir() {
+    let temp_dir = setup_package("coverage_project");
+
+    let custom_cache_dir = temp_dir.path().join("custom_cache");
+    fs::create_dir(&custom_cache_dir).unwrap();
+
+    generate_clean_components(
+        CleanComponentsState {
+            coverage: false,
+            profile: false,
+            cache: true,
+            trace: false,
+        },
+        &temp_dir,
+    );
+
+    runner(&temp_dir)
+        .arg("clean")
+        .arg("cache")
+        .env("SNFOUNDRY_CACHE", &custom_cache_dir)
+        .assert()
+        .success();
+
+    assert!(!custom_cache_dir.exists());
+
+    assert_eq!(
+        check_clean_components_state(temp_dir.path()),
+        CleanComponentsState {
+            coverage: false,
+            profile: false,
+            cache: true,
+            trace: false,
+        }
+    );
+}
+
+#[test]
+fn test_clean_cache_with_custom_cache_dir_preserves_unrelated_files() {
+    let temp_dir = setup_package("coverage_project");
+
+    let custom_cache_dir = temp_dir.path().join("custom_cache");
+    fs::create_dir(&custom_cache_dir).unwrap();
+    fs::write(
+        custom_cache_dir.join(CACHEDIR_TAG_FILENAME),
+        CACHEDIR_TAG_CONTENTS,
+    )
+    .unwrap();
+    fs::write(custom_cache_dir.join(".prev_tests_failed"), "failed_test").unwrap();
+    fs::write(
+        custom_cache_dir.join("http___rpc_example_54060_v0_60_0.json"),
+        "{}",
+    )
+    .unwrap();
+    fs::create_dir(custom_cache_dir.join(USC_CACHE_DIR)).unwrap();
+    fs::write(
+        custom_cache_dir.join(USC_CACHE_DIR).join("entry.json"),
+        "{}",
+    )
+    .unwrap();
+    fs::write(custom_cache_dir.join("keep.txt"), "keep").unwrap();
+
+    runner(&temp_dir)
+        .arg("clean")
+        .arg("cache")
+        .env("SNFOUNDRY_CACHE", &custom_cache_dir)
+        .assert()
+        .success();
+
+    assert!(custom_cache_dir.exists());
+    assert!(!custom_cache_dir.join(CACHEDIR_TAG_FILENAME).exists());
+    assert!(!custom_cache_dir.join(".prev_tests_failed").exists());
+    assert!(
+        !custom_cache_dir
+            .join("http___rpc_example_54060_v0_60_0.json")
+            .exists()
+    );
+    assert!(!custom_cache_dir.join(USC_CACHE_DIR).exists());
+    assert!(custom_cache_dir.join("keep.txt").exists());
+}
+
+#[test]
+#[cfg_attr(
+    feature = "cairo-native",
+    ignore = "Native doesn't support trace, coverage and profiler"
+)]
+fn test_clean_all() {
+    let temp_dir = setup_package("coverage_project");
+
+    let clean_components_state = CleanComponentsState {
+        coverage: true,
+        cache: true,
+        trace: true,
+        profile: true,
+    };
+
+    generate_clean_components(clean_components_state, &temp_dir);
+
+    runner(&temp_dir).arg("clean").arg("all").assert().success();
+
+    let expected_state = CleanComponentsState {
+        coverage: false,
+        profile: false,
+        cache: false,
+        trace: false,
+    };
+
+    assert_eq!(
+        check_clean_components_state(temp_dir.path()),
+        expected_state
+    );
+}
+
+#[test]
+#[cfg_attr(
+    feature = "cairo-native",
+    ignore = "Native doesn't support trace, coverage and profiler"
+)]
+fn test_clean_all_with_custom_cache_dir() {
+    let temp_dir = setup_package("coverage_project");
+
+    let custom_cache_dir = temp_dir.path().join("custom_cache");
+    fs::create_dir(&custom_cache_dir).unwrap();
+
+    generate_clean_components(
+        CleanComponentsState {
+            coverage: true,
+            cache: true,
+            trace: true,
+            profile: true,
+        },
+        &temp_dir,
+    );
+
+    runner(&temp_dir)
+        .arg("clean")
+        .arg("all")
+        .env("SNFOUNDRY_CACHE", &custom_cache_dir)
+        .assert()
+        .success();
+
+    assert!(!custom_cache_dir.exists());
+
+    assert_eq!(
+        check_clean_components_state(temp_dir.path()),
+        CleanComponentsState {
+            coverage: false,
+            profile: false,
+            cache: true,
+            trace: false,
+        }
+    );
+}
+
+#[test]
+#[cfg_attr(feature = "cairo-native", ignore = "Native doesn't support trace yet")]
+fn test_clean_trace_in_workspace() {
+    let temp_dir = setup_hello_workspace();
+
+    test_runner(&temp_dir)
+        .args(["--workspace", "--save-trace-data"])
+        .assert()
+        .code(1);
+
+    let trace_dirs = [
+        temp_dir.path().join(TRACE_DIR),
+        temp_dir.path().join("crates/addition").join(TRACE_DIR),
+        temp_dir.path().join("crates/fibonacci").join(TRACE_DIR),
+    ];
+    for trace_dir in &trace_dirs {
+        assert!(trace_dir.exists(), "{} should exist", trace_dir.display());
+    }
+
+    runner(&temp_dir)
+        .arg("clean")
+        .arg("trace")
+        .assert()
+        .success();
+
+    for trace_dir in &trace_dirs {
+        assert!(
+            !trace_dir.exists(),
+            "{} should be removed",
+            trace_dir.display()
+        );
+    }
+}
+
+#[test]
+fn test_clean_all_and_component() {
+    let temp_dir = setup_package("coverage_project");
+
+    let clean_components_state = CleanComponentsState {
+        coverage: false,
+        cache: true,
+        trace: false,
+        profile: false,
+    };
+    generate_clean_components(clean_components_state, &temp_dir);
+
+    // This command should fail because 'all' cannot be combined with other components
+    let output = runner(&temp_dir)
+        .arg("clean")
+        .arg("all")
+        .arg("cache")
+        .assert()
+        .failure();
+
+    assert_stdout_contains(
+        output,
+        "[ERROR] The 'all' component cannot be combined with other components",
+    );
+}
+
+fn generate_clean_components(state: CleanComponentsState, temp_dir: &TempDir) {
+    let run_test_runner = |args: &[&str]| {
+        test_runner(temp_dir).args(args).assert().success();
+    };
+
+    match state {
+        CleanComponentsState {
+            coverage: true,
+            trace: true,
+            cache: true,
+            profile: false,
+        } => run_test_runner(&["--coverage"]),
+        CleanComponentsState {
+            profile: true,
+            trace: true,
+            cache: true,
+            coverage: false,
+        } => run_test_runner(&["--build-profile"]),
+        CleanComponentsState {
+            trace: true,
+            cache: true,
+            profile: false,
+            coverage: false,
+        } => run_test_runner(&["--save-trace-data"]),
+        CleanComponentsState {
+            coverage: false,
+            profile: false,
+            trace: false,
+            cache: true,
+        } => run_test_runner(&[]),
+        CleanComponentsState {
+            coverage: true,
+            profile: true,
+            trace: true,
+            cache: true,
+        } => {
+            run_test_runner(&["--coverage"]);
+            run_test_runner(&["--build-profile"]);
+        }
+        state => {
+            panic!("Invalid state: {state:?}");
+        }
+    }
+
+    assert_eq!(check_clean_components_state(temp_dir.path()), state);
+}
+
+fn check_clean_components_state(path: &Path) -> CleanComponentsState {
+    let scarb_metadata = metadata_with_opts(MetadataOpts {
+        no_deps: true,
+        current_dir: Some(path.into()),
+        ..MetadataOpts::default()
+    })
+    .unwrap();
+
+    let workspace_root = scarb_metadata.workspace.root;
+
+    let packages_root: Vec<_> = scarb_metadata
+        .packages
+        .into_iter()
+        .map(|package_metadata| package_metadata.root)
+        .collect();
+
+    CleanComponentsState {
+        coverage: dirs_exist(&packages_root, COVERAGE_DIR),
+        profile: dirs_exist(&packages_root, PROFILE_DIR),
+        cache: dir_exists(&workspace_root, DEFAULT_CACHE_DIR),
+        trace: dirs_exist(&packages_root, TRACE_DIR),
+    }
+}
+
+fn dirs_exist(root_dirs: &[Utf8PathBuf], dir_name: &str) -> bool {
+    root_dirs
+        .iter()
+        .all(|root_dir| dir_exists(root_dir, dir_name))
+}
+fn dir_exists(dir: &Utf8PathBuf, dir_name: &str) -> bool {
+    dir.join(dir_name).exists()
+}

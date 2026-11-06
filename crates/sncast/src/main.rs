@@ -1,0 +1,800 @@
+use std::num::{NonZeroU8, NonZeroU16};
+
+use crate::starknet_commands::declare::{DeclareCommonArgs, declare_with_artifacts};
+use crate::starknet_commands::declare_from::DeclareFrom;
+use crate::starknet_commands::deploy::{DeployArguments, DeployCommonArgs};
+use crate::starknet_commands::get::Get;
+use crate::starknet_commands::invoke::InvokeCommonArgs;
+use crate::starknet_commands::utils::felt_or_id::resolve_calldata_to_felts;
+use crate::starknet_commands::utils::{self, Utils};
+use crate::starknet_commands::{
+    account, account::Account as AccountCommand, alias::Alias, call::Call, config_path::ConfigPath,
+    declare::Declare, deploy::Deploy, invoke::Invoke, multicall::Multicall,
+    show_config::ShowConfig,
+};
+use crate::starknet_commands::{get, multicall};
+use anyhow::{Context, Result, anyhow, bail};
+use camino::Utf8PathBuf;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
+use configuration::{Override, find_config_file};
+use conversions::IntoConv;
+use data_transformer::transform;
+use foundry_ui::OutputFormat;
+use mimalloc::MiMalloc;
+use shared::auto_completions::{Completions, generate_completions};
+use sncast::helpers::artifacts::resolve_contract_artifacts;
+use sncast::helpers::command::process_command_result;
+use sncast::helpers::config::resolve_global_config_path_or_warn;
+use sncast::helpers::configuration::{
+    CastConfig, CliConfigOpts, ConfigScope, MaybeConfig, PartialCastConfig, warn_unknown_keys,
+};
+use sncast::helpers::fee::FeeParams;
+use sncast::helpers::output_format::output_format_from_json_flag;
+use sncast::helpers::scarb_utils::{
+    BuildConfig, assert_manifest_path_exists, build_and_load_artifacts, get_package_metadata,
+};
+use sncast::response::declare::{
+    AlreadyDeclaredResponse, DeclareResponse, DeclareTransactionResponse,
+};
+use sncast::response::deploy::{DeployResponse, DeployResponseWithDeclare};
+use sncast::response::errors::{ResponseError, handle_starknet_command_error};
+use sncast::response::explorer_link::block_explorer_link_if_allowed;
+use sncast::response::transformed_call::transform_response;
+use sncast::response::ui::UI;
+use sncast::{
+    PartialWaitParams, WaitForTx, get_account, get_block_id, get_class_hash_by_address,
+    get_contract_class, with_account,
+};
+use starknet_commands::ledger::{self, Ledger};
+use starknet_commands::verify::Verify;
+use starknet_rust::core::types::ContractClass;
+use starknet_rust::core::types::contract::{AbiEntry, CompiledClass, SierraClass};
+use starknet_rust::core::utils::get_selector_from_name;
+use starknet_rust::providers::Provider;
+use starknet_types_core::felt::Felt;
+use std::process::ExitCode;
+use tokio::runtime::Runtime;
+
+mod starknet_commands;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+#[derive(Parser)]
+#[command(
+    version,
+    help_template = "\
+{name} {version}
+{author-with-newline}{about-with-newline}
+Use -h for short descriptions and --help for more details.
+
+{before-help}{usage-heading} {usage}
+
+{all-args}{after-help}
+",
+    after_help = "Read the docs: https://foundry-rs.github.io/starknet-foundry/",
+    after_long_help = "\
+Read the docs:
+- Starknet Foundry Book: https://foundry-rs.github.io/starknet-foundry/
+- Cairo Book: https://book.cairo-lang.org/
+- Starknet Book: https://book.starknet.io/
+- Starknet Documentation: https://docs.starknet.io/
+- Scarb Documentation: https://docs.swmansion.com/scarb/docs.html
+
+Join the community:
+- Follow core developers on X: https://twitter.com/swmansionxyz
+- Get support via Telegram: https://t.me/starknet_foundry_support
+- Or discord: https://discord.gg/starknet-community
+- Or join our general chat (Telegram): https://t.me/starknet_foundry
+
+Report bugs: https://github.com/foundry-rs/starknet-foundry/issues/new/choose\
+"
+)]
+#[command(about = "sncast - All-in-one tool for interacting with Starknet smart contracts", long_about = None)]
+#[command(name = "sncast")]
+struct Cli {
+    /// Profile name in snfoundry.toml config file
+    #[arg(short, long)]
+    profile: Option<String>,
+
+    /// Account to be used for contract declaration;
+    /// When using keystore (`--keystore`), this should be a path to account file
+    /// When using accounts file, this should be an account name
+    #[arg(short = 'a', long)]
+    account: Option<String>,
+
+    /// Path to the file holding accounts info
+    #[arg(short = 'f', long = "accounts-file")]
+    accounts_file_path: Option<Utf8PathBuf>,
+
+    /// Path to keystore file; if specified, --account should be a path to starkli JSON account file
+    #[arg(short, long)]
+    keystore: Option<Utf8PathBuf>,
+
+    /// Scarb profile for building contracts (e.g. release, dev)
+    #[arg(long)]
+    scarb_profile: Option<String>,
+
+    /// If passed, output will be displayed in json format
+    #[arg(short, long, global = true)]
+    json: bool,
+
+    /// If passed, command will wait until transaction is accepted or rejected
+    #[arg(short = 'w', long)]
+    wait: bool,
+
+    /// Adjusts the time after which --wait assumes transaction was not received or rejected
+    #[arg(long)]
+    wait_timeout: Option<NonZeroU16>,
+
+    /// Adjusts the time between consecutive attempts to fetch transaction by --wait flag
+    #[arg(long)]
+    wait_retry_interval: Option<NonZeroU8>,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+impl Cli {
+    /// Prepares and validates [`PartialCastConfig`] from CLI args.
+    pub fn to_partial_config(&self) -> Result<PartialCastConfig> {
+        let config = PartialCastConfig {
+            account: self.account.clone(),
+            keystore: self.keystore.clone(),
+            accounts_file: self.accounts_file_path.clone(),
+            wait_params: Some(PartialWaitParams {
+                timeout: self.wait_timeout,
+                retry_interval: self.wait_retry_interval,
+                ..Default::default()
+            }),
+            scarb_profile: self.scarb_profile.clone(),
+            ..Default::default()
+        };
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Get various data from the network
+    Get(Get),
+
+    /// Declare a contract
+    Declare(Declare),
+
+    /// Declare a contract by fetching it from a different Starknet instance
+    DeclareFrom(DeclareFrom),
+
+    /// Deploy a contract
+    Deploy(Deploy),
+
+    /// Call a contract
+    Call(Call),
+
+    /// Invoke a contract
+    Invoke(Invoke),
+
+    /// Execute multiple calls
+    Multicall(Multicall),
+
+    /// Create and deploy an account
+    Account(AccountCommand),
+
+    /// Manage saved aliases for contract addresses, class hashes, etc.
+    Alias(Alias),
+
+    /// Show current configuration being used
+    ShowConfig(ShowConfig),
+
+    /// Show paths to the config files contributing to the effective configuration
+    ConfigPath(ConfigPath),
+
+    /// Verify a contract
+    Verify(Verify),
+
+    /// Generate completions script
+    Completions(Completions),
+
+    /// Utility commands
+    Utils(Utils),
+
+    /// Interact with Ledger hardware wallet
+    Ledger(Ledger),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+#[group(multiple = false)]
+pub struct Arguments {
+    /// Arguments of the called function serialized as a series of felts
+    #[arg(short, long, value_delimiter = ' ', num_args = 1..)]
+    pub calldata: Option<Vec<String>>,
+
+    // Arguments of the called function as a comma-separated string of Cairo expressions
+    #[arg(long, allow_hyphen_values = true)]
+    pub arguments: Option<String>,
+}
+
+fn abi_from_contract_class(contract_class: &ContractClass) -> Result<Vec<AbiEntry>> {
+    let ContractClass::Sierra(sierra_class) = contract_class else {
+        bail!("Transformation of arguments is not available for Cairo Zero contracts")
+    };
+
+    serde_json::from_str(sierra_class.abi.as_str())
+        .context("Couldn't deserialize ABI received from network")
+}
+
+impl Arguments {
+    fn try_into_calldata(
+        self,
+        abi: &[AbiEntry],
+        selector: &Felt,
+        config: &CastConfig,
+    ) -> Result<Vec<Felt>> {
+        if let Some(calldata) = self.calldata {
+            return resolve_calldata_to_felts(&calldata, config);
+        }
+
+        transform(&self.arguments.unwrap_or_default(), abi, selector)
+    }
+}
+
+impl From<DeployArguments> for Arguments {
+    fn from(value: DeployArguments) -> Self {
+        let DeployArguments {
+            constructor_calldata,
+            arguments,
+        } = value;
+        Self {
+            calldata: constructor_calldata,
+            arguments,
+        }
+    }
+}
+
+fn init_logging() {
+    use std::io;
+    use std::io::IsTerminal;
+    use tracing_log::LogTracer;
+    use tracing_subscriber::filter::{EnvFilter, LevelFilter};
+    use tracing_subscriber::fmt::Layer;
+    use tracing_subscriber::fmt::time::Uptime;
+    use tracing_subscriber::prelude::*;
+
+    let fmt_layer = Layer::new()
+        .with_writer(io::stderr)
+        .with_ansi(io::stderr().is_terminal())
+        .with_timer(Uptime::default())
+        .with_filter(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::WARN.into())
+                .with_default_directive("coins_ledger=off".parse().expect("valid directive"))
+                .with_env_var("SNCAST_LOG")
+                .from_env_lossy(),
+        );
+
+    LogTracer::init().expect("could not initialize log tracer");
+
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(fmt_layer))
+        .expect("could not set up global logger");
+}
+
+fn main() -> ExitCode {
+    init_logging();
+
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches)
+        .expect("should always be possible to reconstruct cli from its own matches");
+
+    let ui = UI::new(output_format_from_json_flag(cli.json));
+
+    let command_name = command_path(&matches);
+
+    match run(cli, &ui) {
+        Ok(code) => code,
+        Err(err) => {
+            ui.print_error(
+                &command_name,
+                ResponseError::from_anyhow(command_name.clone(), &err),
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Return canonical subcommand path (e.g. `account import`, `get tx`) or `sncast` if none.
+fn command_path(matches: &ArgMatches) -> String {
+    let mut parts = Vec::new();
+    let mut cur = matches;
+    while let Some((name, sub)) = cur.subcommand() {
+        parts.push(name.to_string());
+        cur = sub;
+    }
+    if parts.is_empty() {
+        "sncast".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn run(cli: Cli, ui: &UI) -> Result<ExitCode> {
+    let runtime = Runtime::new().expect("Failed to instantiate Runtime");
+
+    if let Commands::Completions(completions) = &cli.command {
+        match ui.output_format() {
+            OutputFormat::Human => generate_completions(completions.shell, &mut Cli::command()),
+            OutputFormat::Json => Err(anyhow!("`--json` flag is not supported")),
+        }
+    } else if let Commands::ConfigPath(_) = &cli.command {
+        let result = starknet_commands::config_path::config_path(ui);
+        Ok(process_command_result("config-path", result, ui, None))
+    } else {
+        let config = get_cast_config(&cli, ui)?;
+        runtime.block_on(run_async_command(cli, config, ui))
+    }
+}
+
+fn resolve_fee_args(command: &mut Commands, config: &FeeParams) {
+    let fee_args = match command {
+        Commands::Declare(declare) => &mut declare.common.fee_args,
+        Commands::DeclareFrom(declare_from) => &mut declare_from.common.fee_args,
+        Commands::Deploy(deploy) => &mut deploy.fee_args,
+        Commands::Invoke(invoke) => &mut invoke.fee_args,
+        Commands::Multicall(multicall) => match &mut multicall.command {
+            multicall::Commands::Run(run) => &mut run.fee_args,
+            multicall::Commands::Execute(execute) => &mut execute.fee_args,
+            multicall::Commands::New(_) => return,
+        },
+        Commands::Account(account_command) => match &mut account_command.command {
+            account::Commands::Deploy(deploy) => &mut deploy.fee_args,
+            account::Commands::Import(_)
+            | account::Commands::Create(_)
+            | account::Commands::Delete(_)
+            | account::Commands::List(_) => return,
+        },
+        Commands::Get(_)
+        | Commands::Call(_)
+        | Commands::Alias(_)
+        | Commands::ShowConfig(_)
+        | Commands::ConfigPath(_)
+        | Commands::Verify(_)
+        | Commands::Completions(_)
+        | Commands::Utils(_)
+        | Commands::Ledger(_) => return,
+    };
+
+    *fee_args = fee_args.resolve(config);
+}
+
+#[expect(clippy::too_many_lines)]
+async fn run_async_command(mut cli: Cli, config: CastConfig, ui: &UI) -> Result<ExitCode> {
+    let wait_config = WaitForTx {
+        wait: cli.wait,
+        wait_params: config.wait_params,
+        show_ui_outputs: true,
+    };
+
+    resolve_fee_args(&mut cli.command, &config.fee_params);
+
+    match cli.command {
+        Commands::Declare(args) => {
+            starknet_commands::declare::declare(args, wait_config, config, ui).await
+        }
+        Commands::DeclareFrom(args) => {
+            starknet_commands::declare_from::declare_from(args, wait_config, config, ui).await
+        }
+        Commands::Deploy(deploy) => {
+            if deploy.common.contract_identifier.contract_name.is_none() && deploy.no_abi {
+                bail!("`--no-abi` can only be used with `--contract-name`");
+            }
+
+            let Deploy {
+                common:
+                    DeployCommonArgs {
+                        contract_identifier: identifier,
+                        arguments,
+                        package,
+                        ..
+                    },
+                fee_args,
+                dry_run_args,
+                rpc,
+                mut nonce,
+                no_abi,
+                ..
+            } = deploy;
+
+            let provider = rpc.get_provider(&config, ui).await?;
+
+            let account = get_account(&config, &provider, &rpc, ui).await?;
+
+            let (class_hash, declare_response, local_abi) = if let Some(class_hash) =
+                identifier.class_hash
+            {
+                let class_hash = class_hash.resolve(&config)?;
+                (class_hash, None, None)
+            } else if let Some(contract_name) = identifier.contract_name {
+                let manifest_path = assert_manifest_path_exists()?;
+                let package_metadata = get_package_metadata(&manifest_path, &package)?;
+                let artifacts = build_and_load_artifacts(
+                    &package_metadata,
+                    &BuildConfig {
+                        scarb_toml_path: manifest_path,
+                        json: cli.json,
+                        profile: config.scarb_profile.clone(),
+                    },
+                    // TODO(#3959) Remove `base_ui`
+                    ui.base_ui(),
+                )
+                .context("Failed to build contract")?;
+
+                let contract_artifacts = resolve_contract_artifacts(&contract_name, &artifacts)?;
+                let contract_definition: SierraClass =
+                    serde_json::from_str(&contract_artifacts.sierra)
+                        .context("Failed to parse sierra artifact")?;
+                let casm_contract_definition: CompiledClass =
+                    serde_json::from_str(&contract_artifacts.casm)
+                        .context("Failed to parse casm artifact")?;
+                let local_abi = contract_definition.abi.clone();
+                let common_args = DeclareCommonArgs {
+                    fee_args,
+                    dry_run_args,
+                    nonce,
+                };
+
+                let declare_result = with_account!(&account, |account| {
+                    declare_with_artifacts(
+                        contract_definition,
+                        casm_contract_definition,
+                        common_args,
+                        no_abi,
+                        account,
+                        WaitForTx {
+                            wait: true,
+                            wait_params: wait_config.wait_params,
+                            show_ui_outputs: wait_config.wait,
+                        },
+                        true,
+                        ui,
+                    )
+                    .await
+                })
+                .map_err(handle_starknet_command_error);
+
+                // Increment nonce after successful declare if it was explicitly provided
+                nonce = nonce.map(|n| n + Felt::ONE);
+
+                match declare_result {
+                    Ok(DeclareResponse::AlreadyDeclared(AlreadyDeclaredResponse {
+                        class_hash,
+                    })) => (class_hash.into_(), None, Some(local_abi)),
+                    Ok(DeclareResponse::Success(declare_transaction_response)) => (
+                        declare_transaction_response.class_hash.into_(),
+                        Some(declare_transaction_response),
+                        Some(local_abi),
+                    ),
+                    Ok(DeclareResponse::DryRun(_)) => {
+                        unreachable!(
+                            "Declaration run by deploy command should not return dry run response"
+                        )
+                    }
+                    Err(err) => {
+                        return Ok(process_command_result::<DeclareTransactionResponse>(
+                            "deploy",
+                            Err(err),
+                            ui,
+                            None,
+                        ));
+                    }
+                }
+            } else {
+                unreachable!("Either `--class_hash` or `--contract_name` must be provided");
+            };
+
+            // safe to unwrap because "constructor" is a standardized name
+            let selector = get_selector_from_name("constructor").unwrap();
+
+            let arguments: Arguments = arguments.into();
+            let abi = if let Some(local_abi) = local_abi {
+                local_abi
+            } else {
+                let contract_class = get_contract_class(class_hash, &provider).await?;
+                abi_from_contract_class(&contract_class)?
+            };
+            let calldata = arguments.try_into_calldata(&abi, &selector, &config)?;
+
+            let result = with_account!(&account, |account| {
+                starknet_commands::deploy::deploy(
+                    class_hash,
+                    &calldata,
+                    deploy.common.salt,
+                    deploy.common.unique,
+                    fee_args,
+                    dry_run_args,
+                    nonce,
+                    account,
+                    wait_config,
+                    ui,
+                )
+                .await
+            })
+            .map_err(handle_starknet_command_error);
+
+            let result = if let Some(declare_response) = declare_response {
+                result.map(|r| {
+                    DeployResponse::WithDeclare(DeployResponseWithDeclare::from_responses(
+                        &r,
+                        &declare_response,
+                    ))
+                })
+            } else {
+                result.map(DeployResponse::Standard)
+            };
+
+            let block_explorer_link =
+                block_explorer_link_if_allowed(&result, provider.chain_id().await?, &config).await;
+            Ok(process_command_result(
+                "deploy",
+                result,
+                ui,
+                block_explorer_link,
+            ))
+        }
+
+        Commands::Call(Call {
+            contract_address,
+            function,
+            arguments,
+            block_id,
+            rpc,
+        }) => {
+            let selector = get_selector_from_name(&function)
+                .context("Failed to convert entry point selector to FieldElement")?;
+            let block_id = get_block_id(&block_id)?;
+            let contract_address = contract_address.resolve(&config)?;
+            let Arguments {
+                calldata,
+                arguments,
+            } = arguments;
+            let calldata = calldata
+                .map(|raw_calldata| resolve_calldata_to_felts(&raw_calldata, &config))
+                .transpose()?;
+
+            let provider = rpc.get_provider(&config, ui).await?;
+
+            let class_hash = get_class_hash_by_address(&provider, contract_address).await?;
+            let contract_class = get_contract_class(class_hash, &provider).await?;
+
+            let calldata = if let Some(calldata) = calldata {
+                calldata
+            } else {
+                transform(
+                    &arguments.unwrap_or_default(),
+                    &abi_from_contract_class(&contract_class)?,
+                    &selector,
+                )?
+            };
+
+            let result = starknet_commands::call::call(
+                contract_address,
+                selector,
+                calldata,
+                &provider,
+                block_id.as_ref(),
+            )
+            .await
+            .map_err(handle_starknet_command_error);
+
+            if let Some(transformed_result) =
+                transform_response(&result, &contract_class, &selector)
+            {
+                Ok(process_command_result(
+                    "call",
+                    Ok(transformed_result),
+                    ui,
+                    None,
+                ))
+            } else {
+                Ok(process_command_result("call", result, ui, None))
+            }
+        }
+
+        Commands::Invoke(invoke) => {
+            let Invoke {
+                common:
+                    InvokeCommonArgs {
+                        contract_address,
+                        function,
+                        arguments,
+                    },
+                fee_args,
+                dry_run_args,
+                proof_args,
+                rpc,
+                nonce,
+                ..
+            } = invoke;
+
+            let selector = get_selector_from_name(&function)
+                .context("Failed to convert entry point selector to FieldElement")?;
+            let contract_address = contract_address.resolve(&config)?;
+            let Arguments {
+                calldata,
+                arguments,
+            } = arguments;
+            let calldata = calldata
+                .map(|raw_calldata| resolve_calldata_to_felts(&raw_calldata, &config))
+                .transpose()?;
+
+            let provider = rpc.get_provider(&config, ui).await?;
+
+            let account = get_account(&config, &provider, &rpc, ui).await?;
+
+            let class_hash = get_class_hash_by_address(&provider, contract_address).await?;
+            let calldata = if let Some(calldata) = calldata {
+                calldata
+            } else {
+                let contract_class = get_contract_class(class_hash, &provider).await?;
+                transform(
+                    &arguments.unwrap_or_default(),
+                    &abi_from_contract_class(&contract_class)?,
+                    &selector,
+                )?
+            };
+
+            let result = with_account!(&account, |account| {
+                starknet_commands::invoke::invoke(
+                    contract_address,
+                    calldata,
+                    nonce,
+                    fee_args,
+                    dry_run_args,
+                    proof_args,
+                    selector,
+                    account,
+                    wait_config,
+                    ui,
+                )
+                .await
+            })
+            .map_err(handle_starknet_command_error);
+
+            let block_explorer_link =
+                block_explorer_link_if_allowed(&result, provider.chain_id().await?, &config).await;
+
+            Ok(process_command_result(
+                "invoke",
+                result,
+                ui,
+                block_explorer_link,
+            ))
+        }
+
+        Commands::Get(get) => get::get(get, config, ui).await,
+
+        Commands::Utils(utils) => utils::utils(utils, config, ui, cli.json).await,
+
+        Commands::Multicall(multicall) => {
+            multicall::multicall(multicall, config, ui, wait_config).await
+        }
+
+        Commands::Account(account) => account::account(account, config, ui, wait_config).await,
+
+        Commands::Alias(alias) => starknet_commands::alias::alias(&alias, &config, ui),
+
+        Commands::ShowConfig(show) => {
+            let provider = match show.rpc.get_provider(&config, ui).await {
+                Ok(p) => Some(p),
+                Err(err) => {
+                    ui.print_warning(format!("Could not reach RPC provider: {err:#}"));
+                    None
+                }
+            };
+
+            let result = starknet_commands::show_config::show_config(
+                &show,
+                provider.as_ref(),
+                config,
+                cli.profile,
+            )
+            .await;
+
+            Ok(process_command_result("show-config", result, ui, None))
+        }
+
+        Commands::Verify(args) => starknet_commands::verify::verify(args, config, ui).await,
+        Commands::Ledger(ledger) => {
+            let result = ledger::ledger(&ledger, ui).await;
+            Ok(process_command_result("ledger", result, ui, None))
+        }
+
+        Commands::Completions(_) | Commands::ConfigPath(_) => {
+            unreachable!("should be handled before this function is called")
+        }
+    }
+}
+
+fn get_cast_config(cli: &Cli, ui: &UI) -> Result<CastConfig> {
+    let opts = CliConfigOpts {
+        profile: cli.profile.clone(),
+    };
+
+    let local_path = find_config_file().ok();
+    let global_path = resolve_global_config_path_or_warn(ui);
+    let profile = opts.profile.as_deref();
+
+    let global_default =
+        PartialCastConfig::load_maybe(global_path.as_ref(), None, ConfigScope::Global)?;
+    let global_profile = if profile.is_some() {
+        PartialCastConfig::load_maybe(global_path.as_ref(), profile, ConfigScope::Global)?
+    } else {
+        MaybeConfig::NoProfile
+    };
+    let local_default =
+        PartialCastConfig::load_maybe(local_path.as_ref(), None, ConfigScope::Local)?;
+    let local_profile = if profile.is_some() {
+        PartialCastConfig::load_maybe(local_path.as_ref(), profile, ConfigScope::Local)?
+    } else {
+        MaybeConfig::NoProfile
+    };
+
+    match (profile, &local_profile, &global_profile) {
+        // Profile must be defined in at least local or global config
+        (Some(profile), MaybeConfig::NoProfile, MaybeConfig::NoProfile) => {
+            bail!(
+                "Profile [{profile}] not found in neither local config at {} nor global config at {}",
+                local_path.unwrap_or_default(),
+                global_path.unwrap_or_default()
+            );
+        }
+        // No local config file; profile must be in global config.
+        (Some(profile), MaybeConfig::NoFile, MaybeConfig::NoProfile) => {
+            bail!(
+                "Profile [{profile}] not found in global config at {}, and no local config found.",
+                global_path.unwrap_or_default()
+            );
+        }
+        // Note: this is potentially unreachable: `get_or_create_global_config_path` should always return dir with existing config file.
+        // TODO: (#3436) remove this if missing global config becomes an error
+        (Some(profile), MaybeConfig::NoProfile, MaybeConfig::NoFile) => {
+            bail!(
+                "Profile [{profile}] not found in local config at {}, and no global config found.",
+                global_path.clone().unwrap_or_default()
+            );
+        }
+        // Note: this is potentially unreachable: `get_or_create_global_config_path` should always return dir with existing config file.
+        // TODO: (#3436) remove this if missing global config becomes an error
+        (Some(profile), MaybeConfig::NoFile, MaybeConfig::NoFile) => {
+            bail!("Profile [{profile}] not found: no config files present");
+        }
+        _ => {}
+    }
+
+    let configs = vec![
+        &global_default,
+        &global_profile,
+        &local_default,
+        &local_profile,
+    ];
+    warn_unknown_keys(&configs, ui);
+
+    let cli_config = cli.to_partial_config()?;
+    let partial_config = PartialCastConfig::default()
+        .override_with(global_default.unwrap_or_default())
+        .override_with(global_profile.unwrap_or_default())
+        .override_with(local_default.unwrap_or_default())
+        .override_with(local_profile.unwrap_or_default())
+        .override_with(cli_config);
+
+    CastConfig::try_from(partial_config).with_context(|| {
+        indoc::formatdoc! {"
+            Unable to combine configs. Fix conflicts between config sources and try again.
+            Sources:
+            - CLI flags
+            - Local config: {local}
+            - Global config: {global}",
+            local = local_path.as_ref().map_or("missing", |p| p.as_str()),
+            global = global_path.as_ref().map_or("missing", |p| p.as_str()),
+        }
+    })
+}

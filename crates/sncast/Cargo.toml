@@ -1,0 +1,89 @@
+[package]
+name = "sncast"
+description = "sncast - a Starknet Foundry CLI client"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+camino.workspace = true
+bigdecimal.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+console.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+starknet-rust = { workspace = true, features = ["ledger"] }
+tokio.workspace = true
+url.workspace = true
+rand.workspace = true
+scarb-metadata.workspace = true
+thiserror.workspace = true
+shellexpand.workspace = true
+toml.workspace = true
+rpassword.workspace = true
+promptly.workspace = true
+scarb-api = { path = "../scarb-api" }
+scarb-ui.workspace = true
+reqwest.workspace = true
+indoc.workspace = true
+tempfile.workspace = true
+conversions = { path = "../conversions" }
+data-transformer = { path = "../data-transformer" }
+configuration = { path = "../configuration" }
+shared = { path = "../shared" }
+itertools.workspace = true
+futures.workspace = true
+starknet-types-core.workspace = true
+starknet_api.workspace = true
+starknet-curve.workspace = true
+semver.workspace = true
+sha2.workspace = true
+starknet-rust-crypto.workspace = true
+async-trait.workspace = true
+serde_path_to_error.workspace = true
+serde_with.workspace = true
+walkdir.workspace = true
+const-hex.workspace = true
+regex.workspace = true
+dirs.workspace = true
+dialoguer.workspace = true
+toml_edit.workspace = true
+num-traits.workspace = true
+foundry-ui = { path = "../foundry-ui" }
+universal-sierra-compiler-api = { path = "../universal-sierra-compiler-api" }
+voyager-verifier = "2.3.1"
+tracing-subscriber.workspace = true
+tracing.workspace = true
+tracing-log.workspace = true
+strum.workspace = true
+strum_macros.workspace = true
+primitive-types.workspace = true
+coins-ledger.workspace = true
+mimalloc.workspace = true
+
+[dev-dependencies]
+ctor.workspace = true
+dtor.workspace = true
+insta = { workspace = true, features = ["json"] }
+snapbox.workspace = true
+indoc.workspace = true
+project-root.workspace = true
+tempfile.workspace = true
+test-case.workspace = true
+fs_extra.workspace = true
+wiremock.workspace = true
+docs = { workspace = true, features = ["testing"] }
+shared = { path = "../shared", features = ["testing"] }
+speculos-client.workspace = true
+
+[features]
+default = []
+ledger-emulator = []
+
+[[bin]]
+name = "sncast"
+path = "src/main.rs"

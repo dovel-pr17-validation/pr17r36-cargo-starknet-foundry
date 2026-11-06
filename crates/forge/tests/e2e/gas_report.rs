@@ -1,0 +1,102 @@
+use crate::assert_cleaned_output;
+use crate::e2e::common::runner::{
+    BASE_FILE_PATTERNS, Package, setup_package, setup_package_with_file_patterns, test_runner,
+};
+use indoc::indoc;
+use shared::test_utils::output_assert::assert_stdout_contains;
+
+#[test]
+fn snap_basic() {
+    let temp = setup_package("simple_package");
+    let output = test_runner(&temp)
+        .arg("--gas-report")
+        .arg("call_and_invoke")
+        .env("SNFORGE_DETERMINISTIC_OUTPUT", "1")
+        .assert()
+        .code(0);
+
+    assert_cleaned_output!(output);
+}
+
+// TODO(#4474): Re-enable once cairo-native variant is fixed
+#[cfg_attr(feature = "cairo-native", ignore = "TODO(#4474)")]
+#[test]
+fn snap_recursive_calls() {
+    let temp = setup_package("debugging");
+    let output = test_runner(&temp)
+        .arg("--gas-report")
+        .arg("test_debugging_trace_success")
+        .env("SNFORGE_DETERMINISTIC_OUTPUT", "1")
+        .assert()
+        .code(0);
+
+    assert_cleaned_output!(output);
+}
+
+#[test]
+fn snap_multiple_contracts_and_constructor() {
+    let temp = setup_package("simple_package_with_cheats");
+    let output = test_runner(&temp)
+        .arg("--gas-report")
+        .arg("call_and_invoke_proxy")
+        .env("SNFORGE_DETERMINISTIC_OUTPUT", "1")
+        .assert()
+        .code(0);
+
+    assert_cleaned_output!(output);
+}
+
+#[test]
+fn snap_fork() {
+    let temp =
+        setup_package_with_file_patterns(Package::Name("forking".to_string()), BASE_FILE_PATTERNS);
+
+    let output = test_runner(&temp)
+        .arg("--gas-report")
+        .arg("test_track_resources")
+        .env("SNFORGE_DETERMINISTIC_OUTPUT", "1")
+        .assert()
+        .code(0);
+
+    assert_cleaned_output!(output);
+}
+
+#[test]
+fn snap_gas_report_no_abi() {
+    let temp = setup_package("debugging_no_abi");
+
+    let output = test_runner(&temp)
+        .arg("--gas-report")
+        .env("SNFORGE_DETERMINISTIC_OUTPUT", "1")
+        .assert()
+        .code(0);
+
+    assert_cleaned_output!(output);
+}
+
+#[test]
+fn no_transactions() {
+    let temp = setup_package("simple_package");
+    let output = test_runner(&temp)
+        .arg("--gas-report")
+        .arg("test_fib")
+        .assert()
+        .code(0);
+
+    assert_stdout_contains(
+        output,
+        indoc! {r"
+    [..]Compiling[..]
+    [..]Finished[..]
+
+
+    Collected 1 test(s) from simple_package package
+    Running 1 test(s) from src/
+    [PASS] simple_package::tests::test_fib (l1_gas: ~0, l1_data_gas: ~0, l2_gas: ~[..])
+    No contract gas usage data to display, no contract calls made.
+
+    Running 0 test(s) from tests/
+    Tests: 1 passed, 0 failed, 0 ignored, [..] filtered out
+    "},
+    );
+}

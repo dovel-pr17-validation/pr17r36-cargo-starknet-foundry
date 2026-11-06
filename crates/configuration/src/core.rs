@@ -1,0 +1,84 @@
+use crate::Config;
+use serde_json::Number;
+use std::env;
+
+fn resolve_env_variables(config: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    match config {
+        serde_json::Value::Object(map) => {
+            let val = map
+                .into_iter()
+                .map(|(k, v)| -> anyhow::Result<(String, serde_json::Value)> {
+                    Ok((k, resolve_env_variables(v)?))
+                })
+                .collect::<anyhow::Result<serde_json::Map<String, serde_json::Value>>>()?;
+            Ok(serde_json::Value::Object(val))
+        }
+        serde_json::Value::Array(val) => {
+            let val = val
+                .into_iter()
+                .map(resolve_env_variables)
+                .collect::<anyhow::Result<Vec<serde_json::Value>>>()?;
+            Ok(serde_json::Value::Array(val))
+        }
+        serde_json::Value::String(val) if val.starts_with('$') => resolve_env_variable(&val),
+        val => Ok(val),
+    }
+}
+
+fn resolve_env_variable(var: &str) -> anyhow::Result<serde_json::Value> {
+    assert!(var.starts_with('$'));
+    let mut initial_value = &var[1..];
+    if initial_value.starts_with('{') && initial_value.ends_with('}') {
+        initial_value = &initial_value[1..initial_value.len() - 1];
+    }
+    let value = env::var(initial_value)?;
+
+    if let Ok(value) = value.parse::<Number>() {
+        return Ok(serde_json::Value::Number(value));
+    }
+    if let Ok(value) = value.parse::<bool>() {
+        return Ok(serde_json::Value::Bool(value));
+    }
+    Ok(serde_json::Value::String(value))
+}
+
+fn get_with_ownership(config: serde_json::Value, key: &str) -> Option<serde_json::Value> {
+    match config {
+        serde_json::Value::Object(mut map) => map.remove(key),
+        _ => None,
+    }
+}
+
+/// Returns `[{tool}.{profile}]` config, or `None` if `[{tool}.{profile}]` is missing.
+fn get_profile(
+    raw_config: serde_json::Value,
+    tool: &str,
+    profile: &str,
+) -> Option<serde_json::Value> {
+    let profile_name = profile;
+    let tool_config = get_with_ownership(raw_config, tool)
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+    get_with_ownership(tool_config, profile_name)
+}
+
+pub enum Profile {
+    None,
+    Default,
+    Some(String),
+}
+
+pub fn load_config<T: Config>(
+    raw_config: serde_json::Value,
+    profile: Profile,
+) -> anyhow::Result<Option<T>> {
+    let raw_config_json = match profile {
+        Profile::None => Some(raw_config),
+        Profile::Default => get_profile(raw_config, T::tool_name(), "default"),
+        Profile::Some(profile) => get_profile(raw_config, T::tool_name(), &profile),
+    };
+    match raw_config_json {
+        Some(raw_config_json) => T::from_raw(resolve_env_variables(raw_config_json)?).map(Some),
+        None => Ok(None),
+    }
+}

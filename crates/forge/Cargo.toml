@@ -1,0 +1,83 @@
+[package]
+name = "forge"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# This should match `MINIMAL_SCARB_VERSION`
+scarb_2_13_1 = []
+no_scarb_installed = []
+non_exact_gas_assertions = []
+scheduled_latest_scarb_only = []
+cairo-native = ["cheatnet/cairo-native", "scarb-api/cairo-native"]
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+blockifier.workspace = true
+camino.workspace = true
+include_dir.workspace = true
+starknet_api.workspace = true
+shared.workspace = true
+cheatnet = { path = "../cheatnet" }
+conversions = { path = "../conversions" }
+configuration = { path = "../configuration" }
+scarb-api = { path = "../scarb-api" }
+forge_runner = { path = "../forge-runner" }
+universal-sierra-compiler-api = { path = "../universal-sierra-compiler-api" }
+cairo-lang-sierra.workspace = true
+cairo-lang-starknet-classes.workspace = true
+cairo-annotations.workspace = true
+starknet-types-core.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+starknet-rust.workspace = true
+num-bigint.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+console.workspace = true
+rand.workspace = true
+scarb-metadata.workspace = true
+scarb-ui.workspace = true
+semver.workspace = true
+cairo-vm.workspace = true
+# openssl is being used, please do not remove it!
+openssl.workspace = true
+toml_edit.workspace = true
+tokio.workspace = true
+futures.workspace = true
+url.workspace = true
+indoc.workspace = true
+derive_more.workspace = true
+foundry-ui = { path = "../foundry-ui" }
+chrono.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true
+tracing-chrome.workspace = true
+rayon.workspace = true
+tempfile.workspace = true
+fs_extra.workspace = true
+comfy-table.workspace = true
+plotters.workspace = true
+create-output-dir.workspace = true
+mimalloc.workspace = true
+
+[[bin]]
+name = "snforge"
+path = "src/main.rs"
+
+[dev-dependencies]
+assert_fs.workspace = true
+snapbox.workspace = true
+axum.workspace = true
+cairo-lang-starknet-classes.workspace = true
+walkdir.workspace = true
+test-case.workspace = true
+itertools.workspace = true
+insta.workspace = true
+docs = { workspace = true, features = ["testing"] }
+packages_validation = { path = "../testing/packages_validation" }
+project-root.workspace = true

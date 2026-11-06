@@ -1,0 +1,178 @@
+# Running Tests
+
+To run tests with `snforge`, simply run the `snforge test` command from the package directory.
+
+```shell
+$ snforge test
+```
+
+<details>
+<summary>Output:</summary>
+
+```shell
+Collected 3 test(s) from hello_snforge package
+Running 0 test(s) from src/
+Running 3 test(s) from tests/
+[PASS] hello_snforge_integrationtest::test_contract::test_calling (l1_gas: ~0, l1_data_gas: ~0, l2_gas: ~40000)
+[PASS] hello_snforge_integrationtest::test_contract::test_executing (l1_gas: ~0, l1_data_gas: ~0, l2_gas: ~40000)
+[PASS] hello_snforge_integrationtest::test_contract::test_calling_another (l1_gas: ~0, l1_data_gas: ~0, l2_gas: ~40000)
+Tests: 3 passed, 0 failed, 0 ignored, 0 filtered out
+```
+</details>
+<br>
+
+## Prerequisites
+
+`snforge test` requires **enabled** gas calculation. 
+This is true by default, so unless you have explicitly disabled it, you shouldn't have to do anything.
+See [`enable-gas`](../appendix/scarb-toml.md#enable-gas) in the `Scarb.toml` reference for details.
+
+## Filtering Tests
+
+You can pass a filter string after the `snforge test` command to filter tests.
+By default, any test with an [absolute module tree path](https://www.starknet.io/cairo-book/ch07-03-paths-for-referring-to-an-item-in-the-module-tree.html#paths-for-referring-to-an-item-in-the-module-tree) matching the filter will be run.
+
+```shell
+$ snforge test calling
+```
+
+<details>
+<summary>Output:</summary>
+
+```shell
+Collected 2 test(s) from hello_snforge package
+Running 0 test(s) from src/
+Running 2 test(s) from tests/
+[PASS] hello_snforge_integrationtest::test_contract::test_calling_another (l1_gas: ~0, l1_data_gas: ~0, l2_gas: ~40000)
+[PASS] hello_snforge_integrationtest::test_contract::test_calling (l1_gas: ~0, l1_data_gas: ~0, l2_gas: ~40000)
+Tests: 2 passed, 0 failed, 0 ignored, 1 filtered out
+```
+</details>
+<br>
+
+## Running a Specific Test
+
+To run a specific test, you can pass a filter string along with an `--exact` flag.
+Note, you have to use a fully qualified test name, including a module name.
+
+> 📝 **Note**
+>
+> Running a specific test results in optimized compilation. `snforge` will try to compile only the desired test, unlike the case of running all tests where all of them are compiled.
+>
+
+```shell
+$ snforge test hello_snforge_integrationtest::test_contract::test_calling --exact
+```
+
+<details>
+<summary>Output:</summary>
+
+```shell
+Collected 1 test(s) from hello_snforge package
+Running 1 test(s) from tests/
+[PASS] hello_snforge_integrationtest::test_contract::test_calling (l1_gas: ~0, l1_data_gas: ~0, l2_gas: ~40000)
+Running 0 test(s) from src/
+Tests: 1 passed, 0 failed, 0 ignored, 2 filtered out
+```
+</details>
+<br>
+
+## Speeding Up Test Compilation
+
+For best cache reuse across repeat runs, prefer the **integration test layout** (`tests/`) over unit tests in `src/`.
+
+Thanks to Scarb's [incremental compilation](https://docs.swmansion.com/scarb/docs/procedural-macros/incremental.html) (enabled by default), the main package and the test code are cached separately, so editing tests does not invalidate the main package's build cache.
+For details on the layout difference, see [Test Collection](test-collection.md).
+
+## Skipping tests
+
+You can use the `--skip` flag to exclude tests matching a specified filter pattern.
+This is useful for temporarily disabling problematic tests or focusing on a subset of tests by excluding others.
+
+You can skip tests by function name, module name or full path:
+- Skip a specific test: `--skip test_feature_a`
+- Skip tests in a module: `--skip nested_module`
+- Skip by full path: `--skip my_tests::nested_module::test_feature_b`
+
+<!-- { "package_name": "failing_example"} -->
+```shell
+$ snforge test --skip test_failing --skip failing_example_tests::test_xyz
+```
+
+<details>
+<summary>Output:</summary>
+
+```shell
+Collected 1 test(s) from failing_example package
+Running 0 test(s) from src/
+Running 1 test(s) from tests/
+[PASS] failing_example_tests::test_abc (l1_gas: ~0, l1_data_gas: ~0, l2_gas: ~40000)
+Tests: 1 passed, 0 failed, 0 ignored, 2 filtered out
+```
+
+</details>
+<br>
+
+## Stopping Test Execution After First Failed Test
+
+To stop the test execution after first failed test, you can pass an `--exit-first` flag along with `snforge test` command.
+
+<!-- { "ignored": true } -->
+```shell
+$ snforge test --exit-first
+```
+
+<details>
+<summary>Output:</summary>
+
+```shell
+Collected 3 test(s) from failing_example package
+Running 3 test(s) from tests/
+[FAIL] failing_example_tests::test_failing
+
+Failure data:
+    0x6661696c696e6720636865636b ('failing check')
+
+
+Failures:
+    failing_example_tests::test_failing
+
+Tests: 0 passed, 1 failed, 0 ignored, 0 filtered out
+Interrupted execution of 2 test(s).
+```
+</details>
+<br>
+
+## Displaying Resources Used During Tests
+
+To track resources like `builtins` / `syscalls` that are used when running tests, use `snforge test --detailed-resources`.
+
+```shell
+$ snforge test --detailed-resources
+```
+
+<details>
+<summary>Output:</summary>
+
+```shell
+Collected 2 test(s) from hello_starknet package
+Running 2 test(s) from tests/
+[PASS] hello_starknet_integrationtest::test_contract::test_cannot_increase_balance_with_zero_value (l1_gas: ~0, l1_data_gas: ~96, l2_gas: ~406680)
+        sierra gas: 406680
+        syscalls: (CallContract: 2, Deploy: 1, StorageRead: 1)
+        events: (count: 0, keys: 0, data size: 0)
+        messages: (l2 to l1: 0, l1 handler: 0)
+
+[PASS] hello_starknet_integrationtest::test_contract::test_increase_balance (l1_gas: ~0, l1_data_gas: ~192, l2_gas: ~511980)
+        sierra gas: 511980
+        syscalls: (CallContract: 3, StorageRead: 3, StorageWrite: 1, Deploy: 1)
+        events: (count: 0, keys: 0, data size: 0)
+        messages: (l2 to l1: 0, l1 handler: 0)
+
+Running 0 test(s) from src/
+Tests: 2 passed, 0 failed, 0 ignored, 0 filtered out
+```
+</details>
+<br>
+
+For more information about how starknet-foundry calculates those, see [gas and resource estimation](gas-and-resource-estimation.md) section.

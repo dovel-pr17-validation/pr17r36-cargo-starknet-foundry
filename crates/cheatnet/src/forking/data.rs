@@ -1,0 +1,35 @@
+use crate::runtime_extensions::forge_runtime_extension::contracts_data::build_selectors_from_abi_map;
+use starknet_api::core::{ClassHash, EntryPointSelector};
+use starknet_rust::core::types::ContractClass;
+use starknet_rust::core::types::contract::AbiEntry;
+use std::collections::HashMap;
+
+#[derive(Default)]
+pub struct ForkData {
+    pub abi: HashMap<ClassHash, Vec<AbiEntry>>,
+    pub selectors: HashMap<EntryPointSelector, String>,
+}
+
+impl ForkData {
+    /// Creates a new instance of [`ForkData`] from a given `fork_compiled_contract_class`.
+    #[must_use]
+    pub fn new(fork_compiled_contract_class: &HashMap<ClassHash, ContractClass>) -> Self {
+        let abi: HashMap<ClassHash, Vec<AbiEntry>> = fork_compiled_contract_class
+            .iter()
+            .filter_map(|(class_hash, contract_class)| {
+                let ContractClass::Sierra(sierra_class) = contract_class else {
+                    return None;
+                };
+
+                let abi = serde_json::from_str::<Vec<AbiEntry>>(&sierra_class.abi)
+                    .expect("this should be valid ABI");
+
+                Some((*class_hash, abi))
+            })
+            .collect();
+
+        let selectors = build_selectors_from_abi_map(&abi);
+
+        Self { abi, selectors }
+    }
+}

@@ -1,0 +1,248 @@
+use std::str::FromStr;
+
+use crate::starknet_commands::account::{
+    PrivateKeyArgs, compute_account_address, generate_add_profile_message, prepare_account_json,
+    validate_private_key, write_account_to_accounts_file,
+};
+use crate::starknet_commands::utils::felt_or_id::{ClassHash, ContractAddress};
+use anyhow::{Result, bail, ensure};
+use camino::Utf8PathBuf;
+use clap::Args;
+use sncast::check_if_legacy_contract;
+use sncast::helpers::account::generate_account_name;
+use sncast::helpers::configuration::CastConfig;
+use sncast::helpers::ledger;
+use sncast::helpers::ledger::LedgerKeyLocatorAccount;
+use sncast::helpers::rpc::RpcArgs;
+use sncast::response::account::import::AccountImportResponse;
+use sncast::response::ui::UI;
+use sncast::{AccountType, SignerType, check_class_hash_exists, get_chain_id, handle_rpc_error};
+use starknet_rust::core::types::{BlockId, BlockTag, StarknetError};
+use starknet_rust::providers::jsonrpc::{HttpTransport, JsonRpcClient};
+use starknet_rust::providers::{Provider, ProviderError};
+use starknet_rust::signers::SigningKey;
+use starknet_types_core::felt::Felt;
+
+#[derive(Args, Debug)]
+#[command(about = "Add an account to the accounts file")]
+pub struct Import {
+    /// Name of the account to be imported
+    #[arg(short, long)]
+    pub name: Option<String>,
+
+    /// Address of the account (hex, decimal, or @alias from snfoundry.toml)
+    #[arg(short, long)]
+    pub address: ContractAddress,
+
+    /// Type of the account
+    #[arg(short = 't', long = "type", value_parser = AccountType::from_str)]
+    pub account_type: AccountType,
+
+    /// Class hash of the account (hex, decimal, or @alias from snfoundry.toml)
+    #[arg(short, long)]
+    pub class_hash: Option<ClassHash>,
+
+    #[command(flatten)]
+    pub private_key_args: PrivateKeyArgs,
+
+    /// Salt for the address
+    #[arg(short, long)]
+    pub salt: Option<Felt>,
+
+    /// If passed, a profile with the provided name and corresponding data will be created in snfoundry.toml
+    #[arg(long)]
+    pub add_profile: Option<String>,
+
+    #[command(flatten)]
+    pub rpc: RpcArgs,
+
+    /// If passed, the command will not trigger an interactive prompt to add an account as a default
+    #[arg(long)]
+    pub silent: bool,
+
+    #[command(flatten)]
+    pub ledger_key_locator: LedgerKeyLocatorAccount,
+}
+
+impl Import {
+    pub fn resolved_address(&self, config: &CastConfig) -> Result<Felt> {
+        self.address.resolve(config)
+    }
+
+    pub fn resolved_class_hash(&self, config: &CastConfig) -> Result<Option<Felt>> {
+        ClassHash::resolve_optional(self.class_hash.as_ref(), config)
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+pub async fn import(
+    account: Option<String>,
+    accounts_file: &Utf8PathBuf,
+    provider: &JsonRpcClient<HttpTransport>,
+    import: &Import,
+    config: &CastConfig,
+    ui: &UI,
+) -> Result<AccountImportResponse> {
+    let address = import.resolved_address(config)?;
+    let class_hash = import.resolved_class_hash(config)?;
+
+    let (signer_type, public_key) = if let Some(ledger_path) = import.ledger_key_locator.resolve(ui)
+    {
+        let public_key = ledger::get_ledger_public_key(&ledger_path, ui).await?;
+        (SignerType::Ledger { ledger_path }, public_key)
+    } else {
+        let key_felt = import.private_key_args.resolve_or_prompt()?;
+        let key_felt = validate_private_key(key_felt)?;
+
+        let signing_key = SigningKey::from_secret_scalar(key_felt);
+        let public_key = signing_key.verifying_key().scalar();
+        (
+            SignerType::Local {
+                private_key: key_felt,
+            },
+            public_key,
+        )
+    };
+
+    let account_name = account
+        .clone()
+        .unwrap_or_else(|| generate_account_name(accounts_file).unwrap());
+
+    let fetched_class_hash = match provider
+        .get_class_hash_at(BlockId::Tag(BlockTag::PreConfirmed), address)
+        .await
+    {
+        Ok(class_hash) => Ok(Some(class_hash)),
+        Err(ProviderError::StarknetError(StarknetError::ContractNotFound)) => Ok(None),
+        Err(err) => Err(handle_rpc_error(err)),
+    }?;
+
+    let deployed: bool = fetched_class_hash.is_some();
+    let class_hash = if let (Some(from_provider), Some(from_user)) =
+        (fetched_class_hash, class_hash)
+    {
+        ensure!(
+            from_provider == from_user,
+            "Incorrect class hash {from_user:#x} for account address {address:#x} was provided"
+        );
+        from_provider
+    } else if let Some(from_user) = class_hash {
+        check_class_hash_exists(provider, from_user).await?;
+        from_user
+    } else if let Some(from_provider) = fetched_class_hash {
+        from_provider
+    } else {
+        bail!(
+            "Class hash for the account address {address:#x} could not be found. Please provide the class hash"
+        );
+    };
+
+    let chain_id = get_chain_id(provider).await?;
+
+    if let Some(salt) = import.salt {
+        let computed_address = compute_account_address(
+            salt,
+            class_hash,
+            import.account_type,
+            chain_id,
+            &signer_type,
+            provider,
+            ui,
+        )
+        .await?;
+        ensure!(
+            computed_address == address,
+            "Computed address {computed_address:#x} does not match the provided address {address:#x}. Please ensure that the provided salt, class hash, and account type are correct."
+        );
+    }
+
+    let legacy = check_if_legacy_contract(Some(class_hash), address, provider).await?;
+
+    let account_json = prepare_account_json(
+        &signer_type,
+        public_key,
+        address,
+        deployed,
+        legacy,
+        import.account_type,
+        Some(class_hash),
+        import.salt,
+    );
+
+    write_account_to_accounts_file(&account_name, accounts_file, chain_id, account_json.clone())?;
+
+    let add_profile_message = generate_add_profile_message(
+        import.add_profile.as_ref(),
+        &import.rpc,
+        &account_name,
+        accounts_file,
+        None,
+        config,
+    )?;
+
+    Ok(AccountImportResponse {
+        add_profile: add_profile_message,
+        account_name,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::starknet_commands::account::parse_input_to_felt;
+    use conversions::string::TryFromHexStr;
+    use starknet_types_core::felt::Felt;
+
+    #[test]
+    fn test_parse_hex_str() {
+        let hex_str = "0x0000000000000000000000000000000000000000000000000000000000000001";
+        let result = parse_input_to_felt(hex_str);
+
+        assert_eq!(result.unwrap(), Felt::try_from_hex_str("0x1").unwrap());
+    }
+
+    #[test]
+    fn test_parse_hex_str_padded() {
+        let hex_str = "0x1a2b3c";
+        let result = parse_input_to_felt(hex_str);
+
+        assert_eq!(result.unwrap(), Felt::try_from_hex_str("0x1a2b3c").unwrap());
+    }
+
+    #[test]
+    fn test_parse_hex_str_invalid() {
+        let hex_str = "0xz";
+        let result = parse_input_to_felt(hex_str);
+
+        assert!(result.is_err());
+        let error_message = result.unwrap_err().to_string();
+        assert_eq!("Failed to parse the value 0xz as a felt", error_message);
+    }
+
+    #[test]
+    fn test_parse_dec_str() {
+        let dec_str = "123";
+        let result = parse_input_to_felt(dec_str);
+
+        assert_eq!(result.unwrap(), Felt::from(123));
+    }
+
+    #[test]
+    fn test_parse_dec_str_negative() {
+        let dec_str = "-123";
+        let result = parse_input_to_felt(dec_str);
+
+        assert!(result.is_err());
+        let error_message = result.unwrap_err().to_string();
+        assert_eq!("Failed to parse the value -123 as a felt", error_message);
+    }
+
+    #[test]
+    fn test_parse_invalid_str() {
+        let invalid_str = "invalid";
+        let result = parse_input_to_felt(invalid_str);
+
+        assert!(result.is_err());
+        let error_message = result.unwrap_err().to_string();
+        assert_eq!("Failed to parse the value invalid as a felt", error_message);
+    }
+}

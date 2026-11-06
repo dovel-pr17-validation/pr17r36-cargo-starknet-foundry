@@ -1,0 +1,414 @@
+use crate::compatibility_check::{Requirement, RequirementsChecker, create_version_parser};
+use anyhow::Result;
+use camino::Utf8PathBuf;
+use clap::builder::BoolishValueParser;
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use derive_more::Display;
+use forge_runner::debugging::TraceArgs;
+use forge_runner::forge_config::ForgeTrackedResource;
+use forge_runner::partition::Partition;
+use foundry_ui::UI;
+use foundry_ui::components::warning::WarningMessage;
+use run_tests::workspace::run_for_workspace;
+use scarb_api::ScarbCommand;
+use scarb_ui::args::{FeaturesSpec, PackagesFilter, ProfileSpec};
+use semver::Version;
+use shared::auto_completions::{Completions, generate_completions};
+use std::cell::RefCell;
+use std::ffi::OsString;
+use std::sync::Arc;
+use std::{
+    num::{NonZeroU32, NonZeroUsize},
+    thread::available_parallelism,
+};
+use tokio::runtime::Builder;
+
+pub mod block_number_map;
+mod clean;
+mod combine_configs;
+mod compatibility_check;
+mod new;
+mod optimize_inlining;
+mod profile_validation;
+pub mod run_tests;
+pub mod scarb;
+pub mod shared_cache;
+pub mod test_filter;
+mod warn;
+
+pub const CAIRO_EDITION: &str = "2024_07";
+
+const MINIMAL_SCARB_VERSION: Version = Version::new(2, 13, 1);
+const MINIMAL_RECOMMENDED_SCARB_VERSION: Version = Version::new(2, 19, 6);
+const MAXIMAL_RECOMMENDED_SCARB_VERSION: Version = Version::new(2, 21, 0);
+const MINIMAL_USC_VERSION: Version = Version::new(2, 10, 0);
+const MINIMAL_SNFORGE_STD_VERSION: Version = Version::new(0, 50, 0);
+
+#[derive(Parser, Debug)]
+#[command(
+    version,
+    help_template = "\
+{name} {version}
+{author-with-newline}{about-with-newline}
+Use -h for short descriptions and --help for more details.
+
+{before-help}{usage-heading} {usage}
+
+{all-args}{after-help}
+",
+    after_help = "Read the docs: https://foundry-rs.github.io/starknet-foundry/",
+    after_long_help = "\
+Read the docs:
+- Starknet Foundry Book: https://foundry-rs.github.io/starknet-foundry/
+- Cairo Book: https://book.cairo-lang.org/
+- Starknet Book: https://book.starknet.io/
+- Starknet Documentation: https://docs.starknet.io/
+- Scarb Documentation: https://docs.swmansion.com/scarb/docs.html
+
+Join the community:
+- Follow core developers on X: https://twitter.com/swmansionxyz
+- Get support via Telegram: https://t.me/starknet_foundry_support
+- Or discord: https://discord.gg/starknet-community
+- Or join our general chat (Telegram): https://t.me/starknet_foundry
+
+Report bugs: https://github.com/foundry-rs/starknet-foundry/issues/new/choose\
+"
+)]
+#[command(about = "snforge - a testing tool for Starknet contracts", long_about = None)]
+#[command(name = "snforge")]
+pub struct Cli {
+    #[command(subcommand)]
+    subcommand: ForgeSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ForgeSubcommand {
+    /// Run tests for a project in the current directory
+    Test {
+        #[command(flatten)]
+        args: Box<TestArgs>,
+    },
+    /// Create a new Forge project at <PATH>
+    New {
+        #[command(flatten)]
+        args: NewArgs,
+    },
+    /// Clean `snforge` generated directories
+    Clean {
+        #[command(flatten)]
+        args: CleanArgs,
+    },
+    /// Check if all `snforge` requirements are installed
+    CheckRequirements,
+    /// Generate completions script
+    Completions(Completions),
+    /// Find optimal inlining-strategy value to minimize gas cost
+    OptimizeInlining {
+        #[command(flatten)]
+        args: Box<optimize_inlining::OptimizeInliningArgs>,
+    },
+}
+
+#[derive(Parser, Debug)]
+pub struct CleanArgs {
+    #[arg(num_args = 1.., required = true)]
+    pub clean_components: Vec<CleanComponent>,
+}
+
+#[derive(ValueEnum, Debug, Clone, PartialEq, Eq)]
+pub enum CleanComponent {
+    /// Clean the `coverage` directory
+    Coverage,
+    /// Clean the `profile` directory
+    Profile,
+    /// Clean the cache directory
+    Cache,
+    /// Clean the `snfoundry_trace` directory
+    Trace,
+    /// Clean all generated directories
+    All,
+}
+
+#[derive(ValueEnum, Debug, Clone)]
+enum ColorOption {
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Parser, Debug)]
+#[expect(clippy::struct_excessive_bools)]
+pub struct TestArgs {
+    /// Name used to filter tests
+    test_filter: Option<String>,
+
+    #[command(flatten)]
+    trace_args: TraceArgs,
+
+    /// Run contracts on `cairo-native` instead of the default `cairo-vm`. This will set `tracked-resource` to `sierra-gas`.
+    ///
+    /// Note: Only contracts execution through native is supported, test code itself will still run on `cairo-vm`.
+    #[arg(long)]
+    #[cfg(feature = "cairo-native")]
+    run_native: bool,
+
+    /// Use exact matches for `test_filter`
+    #[arg(short, long, conflicts_with = "partition", requires = "test_filter")]
+    exact: bool,
+
+    /// Skips any tests whose name contains the given SKIP string.
+    #[arg(long)]
+    skip: Vec<String>,
+
+    /// Stop executing tests after the first failed test
+    #[arg(short = 'x', long)]
+    exit_first: bool,
+
+    /// Sort test result outputs by test name, for reproducible outputs (e.g. for snapshot tests).
+    #[arg(long, env = "SNFORGE_DETERMINISTIC_OUTPUT", default_value_t = false, hide = true, value_parser = BoolishValueParser::new())]
+    deterministic_output: bool,
+
+    /// Number of fuzzer runs
+    #[arg(short = 'r', long)]
+    fuzzer_runs: Option<NonZeroU32>,
+    /// Seed for the fuzzer
+    #[arg(short = 's', long, env = "SNFORGE_FUZZER_SEED")]
+    fuzzer_seed: Option<u64>,
+
+    /// Run only tests marked with `#[ignore]` attribute
+    #[arg(long = "ignored")]
+    only_ignored: bool,
+    /// Run all tests regardless of `#[ignore]` attribute
+    #[arg(long, conflicts_with = "only_ignored")]
+    include_ignored: bool,
+
+    /// Display more detailed info about used resources
+    #[arg(long)]
+    detailed_resources: bool,
+
+    /// Control when colored output is used
+    #[arg(value_enum, long, default_value_t = ColorOption::Auto, value_name="WHEN")]
+    color: ColorOption,
+
+    /// Run tests that failed during the last run
+    #[arg(long)]
+    rerun_failed: bool,
+
+    /// Save execution traces of all test which have passed and are not fuzz tests
+    #[arg(long)]
+    #[cfg_attr(feature = "cairo-native", arg(conflicts_with = "run_native"))]
+    save_trace_data: bool,
+
+    /// Build profiles of all tests which have passed and are not fuzz tests using the cairo-profiler
+    #[arg(long, conflicts_with_all = ["coverage"])]
+    #[cfg_attr(feature = "cairo-native", arg(conflicts_with_all = ["run_native", "coverage"]))]
+    build_profile: bool,
+
+    /// Generate a coverage report for the executed tests which have passed and are not fuzz tests using the cairo-coverage
+    #[arg(long, conflicts_with_all = ["build_profile"])]
+    #[cfg_attr(feature = "cairo-native", arg(conflicts_with_all = ["run_native", "build_profile"]))]
+    coverage: bool,
+
+    /// Number of maximum steps during a single test. For fuzz tests this value is applied to each subtest separately.
+    #[arg(long)]
+    max_n_steps: Option<u32>,
+
+    /// Build contracts separately in the scarb starknet contract target
+    #[arg(long)]
+    no_optimization: bool,
+
+    /// Specify tracked resource type. Overrides `Scarb.toml` when passed.
+    #[arg(long, value_enum)]
+    tracked_resource: Option<ForgeTrackedResource>,
+
+    /// Display a table of L2 gas breakdown for each contract and selector
+    #[arg(long)]
+    gas_report: bool,
+
+    /// Divides tests into `TOTAL` partitions and runs partition `INDEX` (1-based), e.g. 1/4
+    #[arg(long, value_name = "INDEX/TOTAL")]
+    partition: Option<Partition>,
+
+    /// Maximum number of threads used for test execution
+    #[arg(long)]
+    max_threads: Option<NonZeroUsize>,
+
+    /// Additional arguments for cairo-coverage or cairo-profiler
+    #[arg(last = true)]
+    additional_args: Vec<OsString>,
+
+    #[command(flatten)]
+    scarb_args: ScarbArgs,
+
+    /// Launch the given test in debug mode using `cairo-debugger` crate.
+    ///
+    /// It makes snforge act as a debug adapter, enabling communication with an editor/IDE
+    /// such as `VSCode` over DAP protocol.
+    /// It is meant for communication with a DAP client, not command line live debugging.
+    #[arg(long, requires = "exact")]
+    #[cfg_attr(feature = "cairo-native", arg(conflicts_with = "run_native"))]
+    launch_debugger: bool,
+}
+
+impl TestArgs {
+    /// Adjust dependent arguments based on related flags.
+    ///
+    /// This function mutates the `TestArgs` instance to enforce logical coherence
+    /// between fields.
+    pub fn normalize(&mut self) {
+        // Force using `SierraGas` as tracked resource when running with `cairo-native`,
+        // as otherwise it would run on vm.
+        #[cfg(feature = "cairo-native")]
+        if self.run_native {
+            self.tracked_resource = Some(ForgeTrackedResource::SierraGas);
+        }
+    }
+}
+
+#[derive(Parser, Debug)]
+pub struct ScarbArgs {
+    #[command(flatten)]
+    packages_filter: PackagesFilter,
+
+    #[command(flatten)]
+    features: FeaturesSpec,
+
+    #[command(flatten)]
+    profile: ProfileSpec,
+}
+
+#[derive(ValueEnum, Display, Debug, Clone)]
+pub enum Template {
+    /// Simple Cairo program with unit tests
+    #[display("cairo-program")]
+    CairoProgram,
+    /// Basic contract with example tests
+    #[display("balance-contract")]
+    BalanceContract,
+    /// ERC20 contract for mock token
+    #[display("erc20-contract")]
+    Erc20Contract,
+}
+
+#[derive(Parser, Debug)]
+pub struct NewArgs {
+    /// Path to a location where the new project will be created
+    path: Utf8PathBuf,
+    /// Name of a new project, defaults to the directory name
+    #[arg(short, long)]
+    name: Option<String>,
+    /// Do not initialize a new Git repository
+    #[arg(long)]
+    no_vcs: bool,
+    /// Try to create the project even if the specified directory at <PATH> is not empty, which can result in overwriting existing files
+    #[arg(long)]
+    overwrite: bool,
+    /// Template to use for the new project
+    #[arg(short, long, default_value_t = Template::BalanceContract)]
+    template: Template,
+}
+
+pub enum ExitStatus {
+    Success,
+    Failure,
+}
+
+#[tracing::instrument(skip_all, level = "debug")]
+pub fn main_execution(ui: Arc<UI>) -> Result<ExitStatus> {
+    let cli = Cli::parse();
+
+    match cli.subcommand {
+        ForgeSubcommand::New { args } => {
+            new::new(args)?;
+            Ok(ExitStatus::Success)
+        }
+        ForgeSubcommand::Clean { args } => {
+            clean::clean(args, &ui)?;
+            Ok(ExitStatus::Success)
+        }
+        ForgeSubcommand::Test { mut args } => {
+            args.normalize();
+            check_requirements(false, &ui)?;
+
+            let cores = resolve_thread_count(args.max_threads, &ui);
+            let rt = Builder::new_multi_thread()
+                .max_blocking_threads(cores)
+                .enable_all()
+                .build()?;
+
+            rt.block_on(run_for_workspace(*args, ui))
+        }
+        ForgeSubcommand::CheckRequirements => {
+            check_requirements(true, &ui)?;
+            Ok(ExitStatus::Success)
+        }
+        ForgeSubcommand::Completions(completions) => {
+            generate_completions(completions.shell, &mut Cli::command())?;
+            Ok(ExitStatus::Success)
+        }
+        ForgeSubcommand::OptimizeInlining { args } => {
+            let cores = resolve_thread_count(args.test_args.max_threads, &ui);
+            check_requirements(false, &ui)?;
+            optimize_inlining::optimize_inlining(&args, cores, &ui)
+        }
+    }
+}
+
+#[tracing::instrument(skip_all, level = "debug")]
+fn check_requirements(output_on_success: bool, ui: &UI) -> Result<()> {
+    let mut requirements_checker = RequirementsChecker::new(output_on_success);
+    requirements_checker.add_requirement(Requirement {
+        name: "Scarb".to_string(),
+        command: RefCell::new(ScarbCommand::new().arg("--version").command()),
+        minimal_version: MINIMAL_SCARB_VERSION,
+        minimal_recommended_version: Some(MINIMAL_RECOMMENDED_SCARB_VERSION),
+        maximal_recommended_version: Some(MAXIMAL_RECOMMENDED_SCARB_VERSION),
+        helper_text: "Follow instructions from https://docs.swmansion.com/scarb/download.html"
+            .to_string(),
+        version_parser: create_version_parser("Scarb", r"scarb (?<version>[0-9]+.[0-9]+.[0-9]+)"),
+    });
+
+    requirements_checker.add_requirement(Requirement {
+        name: "Universal Sierra Compiler".to_string(),
+        command: RefCell::new(universal_sierra_compiler_api::version_command()?),
+        minimal_version: MINIMAL_USC_VERSION,
+        minimal_recommended_version: None,
+        maximal_recommended_version: None,
+        helper_text: "Reinstall `snforge` using the same installation method or follow instructions from https://foundry-rs.github.io/starknet-foundry/getting-started/installation.html#universal-sierra-compiler-update".to_string(),
+        version_parser: create_version_parser(
+            "Universal Sierra Compiler",
+            r"universal-sierra-compiler (?<version>[0-9]+.[0-9]+.[0-9]+)",
+        ),
+    });
+    requirements_checker.check(ui)?;
+
+    Ok(())
+}
+
+fn resolve_thread_count(max_threads: Option<NonZeroUsize>, ui: &UI) -> usize {
+    match (available_parallelism(), max_threads) {
+        (Ok(available_cores), Some(max_threads)) => {
+            let available = available_cores.get();
+            let max = max_threads.get();
+            if max > available {
+                ui.println(&WarningMessage::new(format!(
+                    "`--max-threads` value ({max}) is greater than the number of available cores ({available})"
+                )));
+            }
+            max
+        }
+        (Ok(available_cores), None) => available_cores.get(),
+        (Err(_), Some(max_threads)) => {
+            ui.println(&WarningMessage::new(
+                "Failed to get the number of available cores, using `--max-threads` value",
+            ));
+            max_threads.get()
+        }
+        (Err(_), None) => {
+            ui.println(&WarningMessage::new(
+                "Failed to get the number of available cores, defaulting to 1",
+            ));
+            1
+        }
+    }
+}

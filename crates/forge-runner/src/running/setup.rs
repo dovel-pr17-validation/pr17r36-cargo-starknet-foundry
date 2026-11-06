@@ -1,0 +1,202 @@
+use crate::package_tests::TestDetails;
+use anyhow::{Context, anyhow};
+use blockifier::blockifier_versioned_constants::BuiltinGasCosts;
+use blockifier::execution::contract_class::EntryPointV1;
+use blockifier::execution::entry_point::{EntryPointExecutionContext, ExecutableCallEntryPoint};
+use blockifier::execution::entry_point_execution::prepare_program_extra_data;
+use blockifier::execution::errors::PreExecutionError;
+use blockifier::execution::execution_utils::ReadOnlySegments;
+use blockifier::execution::syscalls::hint_processor::SyscallHintProcessor;
+use blockifier::state::state_api::State;
+use cairo_lang_casm::hints::Hint;
+use cairo_vm::types::builtin_name::BuiltinName;
+use cairo_vm::types::layout_name::LayoutName;
+use cairo_vm::types::program::Program;
+use cairo_vm::types::relocatable::Relocatable;
+use cairo_vm::vm::runners::cairo_runner::CairoRunner;
+use cheatnet::constants::build_test_entry_point;
+use starknet_api::deprecated_contract_class::EntryPointOffset;
+use std::collections::{BTreeMap, HashMap};
+use universal_sierra_compiler_api::representation::{RawCasmProgram, RawCostTokenType};
+
+/// `Const` token counts are already denominated in gas units.
+const CONST_TOKEN_GAS_COST: u64 = 1;
+
+// Based on structure from (blockifier 0.13.5) https://github.com/starkware-libs/sequencer/blob/e417a9e7d50cbd78065d357763df2fbc2ad41f7c/crates/blockifier/src/execution/entry_point_execution.rs#L39
+// Logic of `initialize_execution_context` had to be modified so this struct ended up modified as well.
+// Probably won't be possible to upstream it.
+pub struct VmExecutionContext<'a> {
+    pub runner: CairoRunner,
+    pub syscall_handler: SyscallHintProcessor<'a>,
+    pub initial_syscall_ptr: Relocatable,
+    // Additional data required for execution is appended after the program bytecode.
+    pub program_extra_data_length: usize,
+}
+
+// Based on code from (blockifier 0.13.5) https://github.com/starkware-libs/sequencer/blob/e417a9e7d50cbd78065d357763df2fbc2ad41f7c/crates/blockifier/src/execution/entry_point_execution.rs#L122
+// Enough of the logic of this had to be changed that probably it won't be possible to upstream it
+#[tracing::instrument(skip_all, level = "debug")]
+pub fn initialize_execution_context<'a>(
+    call: ExecutableCallEntryPoint,
+    hints: &'a HashMap<String, Hint>,
+    program: &Program,
+    state: &'a mut dyn State,
+    context: &'a mut EntryPointExecutionContext,
+) -> Result<VmExecutionContext<'a>, PreExecutionError> {
+    // Instantiate Cairo runner.
+    let proof_mode = false;
+    let trace_enabled = true;
+    let dynamic_layout_params = None;
+    let disable_trace_padding = false;
+    let mut runner = CairoRunner::new(
+        program,
+        LayoutName::all_cairo,
+        dynamic_layout_params,
+        proof_mode,
+        trace_enabled,
+        disable_trace_padding,
+    )?;
+
+    runner.initialize_function_runner_cairo_1(&builtins_from_program(program))?;
+    let mut read_only_segments = ReadOnlySegments::default();
+    let program_extra_data_length = prepare_program_extra_data(
+        &mut runner,
+        program.data_len(),
+        &mut read_only_segments,
+        &context.versioned_constants().os_constants.gas_costs,
+    )?;
+
+    // Instantiate syscall handler.
+    let initial_syscall_ptr = runner.vm.add_memory_segment();
+    let syscall_handler = SyscallHintProcessor::new(
+        state,
+        context,
+        initial_syscall_ptr,
+        call,
+        hints,
+        read_only_segments,
+    );
+
+    Ok(VmExecutionContext {
+        runner,
+        syscall_handler,
+        initial_syscall_ptr,
+        program_extra_data_length,
+    })
+}
+
+// Builtins field is private in program, so we need this workaround
+fn builtins_from_program(program: &Program) -> Vec<BuiltinName> {
+    program.iter_builtins().copied().collect::<Vec<_>>()
+}
+
+/// Returns the compiler-inferred initial gas budget for a raw Sierra function.
+pub fn raw_function_initial_budget(
+    test_details: &TestDetails,
+    casm_program: &RawCasmProgram,
+    builtin_gas_costs: &BuiltinGasCosts,
+) -> anyhow::Result<u64> {
+    let function_costs = casm_program
+        .function_costs
+        .get(&test_details.sierra_entry_point_statement_idx)
+        .ok_or_else(|| {
+            anyhow!(
+                "Raw CASM does not contain the cost of Sierra function at statement index {}",
+                test_details.sierra_entry_point_statement_idx
+            )
+        })?;
+
+    raw_function_cost_to_gas(function_costs, builtin_gas_costs)
+}
+
+fn raw_function_cost_to_gas(
+    function_costs: &BTreeMap<RawCostTokenType, i64>,
+    builtin_gas_costs: &BuiltinGasCosts,
+) -> anyhow::Result<u64> {
+    function_costs
+        .iter()
+        .try_fold(0_u64, |total, (token_type, count)| {
+            let count = u64::try_from(*count)
+                .with_context(|| format!("Negative raw Sierra function cost for {token_type:?}"))?;
+            let token_gas_cost = match token_type {
+                RawCostTokenType::Const => CONST_TOKEN_GAS_COST,
+                RawCostTokenType::Pedersen => builtin_gas_costs.pedersen,
+                RawCostTokenType::Poseidon => builtin_gas_costs.poseidon,
+                RawCostTokenType::Bitwise => builtin_gas_costs.bitwise,
+                RawCostTokenType::EcOp => builtin_gas_costs.ecop,
+                RawCostTokenType::AddMod => builtin_gas_costs.add_mod,
+                RawCostTokenType::MulMod => builtin_gas_costs.mul_mod,
+                RawCostTokenType::Blake => builtin_gas_costs.blake,
+            };
+            let token_cost = count
+                .checked_mul(token_gas_cost)
+                .ok_or_else(|| anyhow!("Raw Sierra function cost overflow for {token_type:?}"))?;
+
+            total
+                .checked_add(token_cost)
+                .ok_or_else(|| anyhow!("Raw Sierra function cost overflow for {token_type:?}"))
+        })
+}
+
+pub fn build_test_call_and_entry_point(
+    test_details: &TestDetails,
+    casm_program: &RawCasmProgram,
+    program: &Program,
+) -> (ExecutableCallEntryPoint, EntryPointV1) {
+    let sierra_instruction_idx = test_details.sierra_entry_point_statement_idx;
+    let casm_entry_point_offset = casm_program.debug_info[sierra_instruction_idx].0;
+
+    let call = build_test_entry_point();
+    let entry_point = EntryPointV1 {
+        selector: call.entry_point_selector,
+        offset: EntryPointOffset(casm_entry_point_offset),
+        builtins: builtins_from_program(program),
+    };
+    (call, entry_point)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_raw_function_cost_tokens_to_gas() {
+        let function_costs = BTreeMap::from([
+            (RawCostTokenType::Const, 1),
+            (RawCostTokenType::Pedersen, 2),
+            (RawCostTokenType::Poseidon, 3),
+            (RawCostTokenType::Bitwise, 4),
+            (RawCostTokenType::EcOp, 5),
+            (RawCostTokenType::AddMod, 6),
+            (RawCostTokenType::MulMod, 7),
+            (RawCostTokenType::Blake, 8),
+        ]);
+        let builtin_gas_costs = BuiltinGasCosts {
+            pedersen: 2,
+            poseidon: 3,
+            bitwise: 5,
+            ecop: 7,
+            add_mod: 11,
+            mul_mod: 13,
+            blake: 17,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            raw_function_cost_to_gas(&function_costs, &builtin_gas_costs).unwrap(),
+            1 + 2 * 2 + 3 * 3 + 4 * 5 + 5 * 7 + 6 * 11 + 7 * 13 + 8 * 17
+        );
+    }
+
+    #[test]
+    fn rejects_negative_raw_function_cost() {
+        let function_costs = BTreeMap::from([(RawCostTokenType::Const, -1)]);
+
+        assert!(
+            raw_function_cost_to_gas(&function_costs, &BuiltinGasCosts::default())
+                .unwrap_err()
+                .to_string()
+                .contains("Negative raw Sierra function cost")
+        );
+    }
+}

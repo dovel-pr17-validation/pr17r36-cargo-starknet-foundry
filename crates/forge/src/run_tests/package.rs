@@ -1,0 +1,316 @@
+use super::{
+    resolve_config::resolve_config,
+    test_target::{ExitFirstChannel, TestTargetRunResult, run_for_test_target},
+};
+use crate::scarb::{
+    config::{ForgeConfigFromScarb, ForkTarget},
+    load_package_config,
+};
+use crate::{
+    TestArgs,
+    block_number_map::BlockNumberMap,
+    combine_configs::combine_configs,
+    run_tests::messages::{
+        collected_tests_count::CollectedTestsCountMessage, tests_run::TestsRunMessage,
+        tests_summary::TestsSummaryMessage,
+    },
+    shared_cache::FailedTestsCache,
+    test_filter::TestsFilter,
+    warn::warn_if_incompatible_rpc_version,
+};
+use anyhow::Result;
+use camino::{Utf8Path, Utf8PathBuf};
+use cheatnet::runtime_extensions::forge_runtime_extension::contracts_data::ContractsData;
+use console::Style;
+use forge_runner::{
+    filtering::NameFilter,
+    forge_config::{ForgeConfig, ForgeTrackedResource},
+    package_tests::{
+        TestTargetLocation,
+        raw::TestTargetRaw,
+        with_config_resolved::{
+            TestCaseWithResolvedConfig, TestTargetWithResolvedConfig, sanitize_test_case_name,
+        },
+    },
+    partition::PartitionConfig,
+    running::target::{PrepareTestTargetResult, prepare_test_target},
+    scarb::load_test_artifacts,
+    test_case_summary::AnyTestCaseSummary,
+    test_target_summary::TestTargetSummary,
+};
+use foundry_ui::{UI, components::labeled::LabeledMessage};
+use scarb_api::{CompilationOpts, get_contracts_artifacts_and_source_sierra_paths};
+use scarb_metadata::{Metadata, PackageMetadata};
+use shared::cache::usc_cache_dir;
+use std::sync::Arc;
+use tokio::task::JoinHandle;
+
+type PrepareTargetHandle = JoinHandle<Result<PrepareTestTargetResult>>;
+
+pub struct PackageTestResult {
+    summaries: Vec<TestTargetSummary>,
+    filtered: usize,
+}
+
+impl PackageTestResult {
+    #[must_use]
+    pub fn new(summaries: Vec<TestTargetSummary>, filtered: usize) -> Self {
+        Self {
+            summaries,
+            filtered,
+        }
+    }
+
+    #[must_use]
+    pub fn filtered(&self) -> usize {
+        self.filtered
+    }
+
+    #[must_use]
+    pub fn summaries(self) -> Vec<TestTargetSummary> {
+        self.summaries
+    }
+}
+
+pub struct RunForPackageArgs {
+    pub target_handles: Vec<PrepareTargetHandle>,
+    pub tests_filter: TestsFilter,
+    pub forge_config: Arc<ForgeConfig>,
+    pub fork_targets: Vec<ForkTarget>,
+    pub package_name: String,
+    pub package_root: Utf8PathBuf,
+}
+
+impl RunForPackageArgs {
+    #[tracing::instrument(skip_all, level = "debug")]
+    pub fn build(
+        package: PackageMetadata,
+        scarb_metadata: &Metadata,
+        args: &TestArgs,
+        cache_dir: &Utf8PathBuf,
+        artifacts_dir: &Utf8Path,
+        partitioning_config: PartitionConfig,
+        ui: &UI,
+    ) -> Result<RunForPackageArgs> {
+        let mut raw_test_targets = load_test_artifacts(artifacts_dir, &package)?;
+
+        let usc_cache_dir = usc_cache_dir(cache_dir);
+        let contracts = get_contracts_artifacts_and_source_sierra_paths(
+            artifacts_dir,
+            &package,
+            &usc_cache_dir,
+            ui,
+            CompilationOpts {
+                use_test_target_contracts: !args.no_optimization,
+                #[cfg(feature = "cairo-native")]
+                run_native: args.run_native,
+            },
+        )?;
+        #[cfg(feature = "cairo-native")]
+        let run_native = args.run_native;
+        #[cfg(not(feature = "cairo-native"))]
+        let run_native = false;
+        let contracts_data = ContractsData::try_from(contracts, run_native)?;
+
+        let forge_config_from_scarb =
+            load_package_config::<ForgeConfigFromScarb>(scarb_metadata, &package.id)?;
+        let forge_config = Arc::new(combine_configs(
+            args,
+            contracts_data,
+            cache_dir.clone(),
+            &forge_config_from_scarb,
+        ));
+
+        let tests_filter = TestsFilter::from_flags(
+            args.test_filter.clone(),
+            args.exact,
+            args.skip.clone(),
+            args.only_ignored,
+            args.include_ignored,
+            args.rerun_failed,
+            FailedTestsCache::new(cache_dir),
+            partitioning_config,
+        );
+
+        if args.deterministic_output {
+            raw_test_targets.sort_by_key(|t| t.tests_location);
+        }
+
+        let tracked_resource = forge_config.test_runner_config.tracked_resource;
+
+        let target_handles = raw_test_targets
+            .into_iter()
+            .map(|t| {
+                spawn_prepare_test_target(
+                    t,
+                    tracked_resource,
+                    tests_filter.name_filter.clone(),
+                    tests_filter.partitioning_config.clone(),
+                    usc_cache_dir.clone(),
+                )
+            })
+            .collect();
+
+        Ok(RunForPackageArgs {
+            target_handles,
+            forge_config,
+            tests_filter,
+            fork_targets: forge_config_from_scarb.fork,
+            package_name: package.name.clone(),
+            package_root: package.root,
+        })
+    }
+}
+
+fn spawn_prepare_test_target(
+    target: TestTargetRaw,
+    tracked_resource: ForgeTrackedResource,
+    name_filter: NameFilter,
+    partitioning_config: PartitionConfig,
+    usc_cache_dir: Utf8PathBuf,
+) -> PrepareTargetHandle {
+    tokio::task::spawn_blocking(move || {
+        prepare_test_target(
+            target,
+            &tracked_resource,
+            &name_filter,
+            &partitioning_config,
+            usc_cache_dir.as_path(),
+        )
+    })
+}
+
+fn sum_test_cases_from_test_target(
+    test_cases: &[TestCaseWithResolvedConfig],
+    partitioning_config: &PartitionConfig,
+) -> usize {
+    test_cases
+        .iter()
+        .filter(|test_case| {
+            partitioning_config.is_in_partition(&sanitize_test_case_name(&test_case.name))
+        })
+        .count()
+}
+
+#[tracing::instrument(skip_all, level = "debug")]
+pub async fn run_for_package(
+    RunForPackageArgs {
+        target_handles,
+        forge_config,
+        tests_filter,
+        fork_targets,
+        package_name,
+        package_root: _,
+    }: RunForPackageArgs,
+    block_number_map: &BlockNumberMap,
+    ui: Arc<UI>,
+    exit_first_channel: &mut ExitFirstChannel,
+) -> Result<PackageTestResult> {
+    // Resolve all targets first so the collected count includes #[ignore] filtering.
+    let mut resolved_targets: Vec<(TestTargetLocation, Option<TestTargetWithResolvedConfig>)> =
+        vec![];
+    let mut all_tests = 0;
+    // Tests left after target preparation and runtime filtering (`#[ignore]`, rerun-failed, etc.).
+    let mut not_filtered_total = 0;
+    // Tests excluded before config resolution, currently by name filtering in `prepare_test_target`.
+    let mut prefiltered_out_total = 0;
+
+    for handle in target_handles {
+        let PrepareTestTargetResult {
+            target: maybe_target,
+            location: tests_location,
+            prefiltered_out_count,
+        } = handle.await??;
+        prefiltered_out_total += prefiltered_out_count;
+
+        let Some(target_with_config) = maybe_target else {
+            resolved_targets.push((tests_location, None));
+            continue;
+        };
+
+        let mut resolved = resolve_config(
+            target_with_config,
+            &fork_targets,
+            block_number_map,
+            &tests_filter,
+        )
+        .await?;
+
+        let all = sum_test_cases_from_test_target(
+            &resolved.test_cases,
+            &tests_filter.partitioning_config,
+        );
+        tests_filter.filter_tests(&mut resolved.test_cases)?;
+        let not_filtered = sum_test_cases_from_test_target(
+            &resolved.test_cases,
+            &tests_filter.partitioning_config,
+        );
+        all_tests += all;
+        not_filtered_total += not_filtered;
+
+        resolved_targets.push((tests_location, Some(resolved)));
+    }
+
+    warn_if_incompatible_rpc_version(
+        resolved_targets
+            .iter()
+            .filter_map(|(_, resolved)| resolved.as_ref()),
+        ui.clone(),
+    )
+    .await?;
+
+    ui.println(&CollectedTestsCountMessage {
+        tests_num: not_filtered_total,
+        package_name: package_name.clone(),
+    });
+
+    let mut summaries = vec![];
+
+    for (location, resolved) in resolved_targets {
+        let Some(resolved) = resolved else {
+            ui.println(&TestsRunMessage::new(location, 0));
+            continue;
+        };
+
+        ui.println(&TestsRunMessage::new(
+            resolved.tests_location,
+            sum_test_cases_from_test_target(
+                &resolved.test_cases,
+                &tests_filter.partitioning_config,
+            ),
+        ));
+
+        let summary = run_for_test_target(
+            resolved,
+            forge_config.clone(),
+            &tests_filter,
+            ui.clone(),
+            exit_first_channel,
+        )
+        .await?;
+
+        let (TestTargetRunResult::Ok(s) | TestTargetRunResult::Interrupted(s)) = summary;
+        summaries.push(s);
+    }
+
+    let filtered_count = prefiltered_out_total + all_tests - not_filtered_total;
+
+    ui.println(&TestsSummaryMessage::new(&summaries, filtered_count));
+
+    let any_fuzz_test_was_run = summaries.iter().any(|test_target_summary| {
+        test_target_summary
+            .test_case_summaries
+            .iter()
+            .filter(|summary| matches!(summary, AnyTestCaseSummary::Fuzzing(_)))
+            .any(|summary| summary.is_passed() || summary.is_failed())
+    });
+
+    if any_fuzz_test_was_run {
+        ui.println(&LabeledMessage::new(
+            &Style::new().bold().apply_to("Fuzzer seed").to_string(),
+            &forge_config.test_runner_config.fuzzer_seed.to_string(),
+        ));
+    }
+
+    Ok(PackageTestResult::new(summaries, filtered_count))
+}

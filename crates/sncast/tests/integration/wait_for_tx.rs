@@ -1,0 +1,178 @@
+use std::num::{NonZeroU8, NonZeroU16};
+
+use crate::helpers::{
+    constants::{ACCOUNT, ACCOUNT_FILE_PATH, URL},
+    fixtures::{create_test_provider, invoke_contract},
+};
+use camino::Utf8PathBuf;
+use sncast::helpers::{
+    configuration::CastConfig, constants::UDC_ADDRESS, fee::FeeSettings, rpc::RpcArgs,
+};
+use sncast::response::ui::UI;
+use url::Url;
+
+use crate::helpers::constants::{
+    CONSTRUCTOR_WITH_PARAMS_CONTRACT_CLASS_HASH_SEPOLIA, MAP_CONTRACT_CLASS_HASH_SEPOLIA,
+    MAP_CONTRACT_DECLARE_TX_HASH_SEPOLIA,
+};
+use conversions::string::IntoHexStr;
+use sncast::{ValidatedWaitParams, get_account};
+use sncast::{WaitForTx, handle_wait_for_tx, wait_for_tx};
+use starknet_rust::contract::{ContractFactory, UdcSelector};
+use starknet_types_core::felt::Felt;
+
+#[tokio::test]
+async fn test_happy_path() {
+    let provider = create_test_provider();
+    let ui = UI::default();
+    let res = wait_for_tx(
+        &provider,
+        MAP_CONTRACT_DECLARE_TX_HASH_SEPOLIA.parse().unwrap(),
+        ValidatedWaitParams::default(),
+        Some(&ui),
+    )
+    .await;
+
+    assert!(res.is_ok());
+    assert!(matches!(res.unwrap().as_str(), "Transaction accepted"));
+}
+
+#[tokio::test]
+async fn test_rejected_transaction() {
+    let provider = create_test_provider();
+    let config = CastConfig {
+        account: ACCOUNT.to_string(),
+        accounts_file: Utf8PathBuf::from(ACCOUNT_FILE_PATH),
+        ..Default::default()
+    };
+    let rpc_args = RpcArgs {
+        url: Some(Url::parse(URL).unwrap()),
+        network: None,
+    };
+    let account = get_account(&config, &provider, &rpc_args, &UI::default())
+        .await
+        .expect("Could not get the account");
+
+    let account = match account {
+        sncast::AccountVariant::LocalWallet(acc) => acc,
+        sncast::AccountVariant::Ledger(_) => panic!("Ledger account not supported in tests"),
+    };
+
+    let factory = ContractFactory::new_with_udc(
+        MAP_CONTRACT_CLASS_HASH_SEPOLIA.parse().unwrap(),
+        account,
+        UdcSelector::New,
+    );
+    let deployment = factory
+        .deploy_v3(Vec::new(), Felt::ONE, false)
+        .l1_gas(1)
+        .l2_gas(1)
+        .l1_data_gas(1)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!(e));
+
+    let resp = deployment.unwrap_err();
+
+    assert_eq!(
+        resp.to_string(),
+        "The transaction's resources don't cover validation or the minimal transaction fee"
+    );
+}
+
+#[tokio::test]
+#[should_panic(
+    expected = "Transaction execution failed: Provider(StarknetError(InsufficientResourcesForValidate))"
+)]
+async fn test_wait_for_reverted_transaction() {
+    let provider = create_test_provider();
+    let salt = "0x029c81e6487b5f9278faa6f454cda3c8eca259f99877faab823b3704327cd695";
+
+    let fee_settings = FeeSettings {
+        l1_gas: Some(1),
+        l1_gas_price: Some(1),
+        l2_gas: Some(1),
+        l2_gas_price: Some(1),
+        l1_data_gas: Some(1),
+        l1_data_gas_price: Some(1),
+        tip: None,
+    };
+    let transaction_hash = invoke_contract(
+        ACCOUNT,
+        UDC_ADDRESS.into_hex_string().as_str(),
+        "deployContract",
+        fee_settings,
+        &[
+            CONSTRUCTOR_WITH_PARAMS_CONTRACT_CLASS_HASH_SEPOLIA,
+            salt,
+            "0x1",
+            "0x3",
+            "0x43",
+            "0x41",
+            "0x1",
+        ],
+    )
+    .await
+    .transaction_hash;
+
+    let ui = UI::default();
+    wait_for_tx(
+        &provider,
+        transaction_hash,
+        ValidatedWaitParams::new(NonZeroU8::new(1).unwrap(), NonZeroU16::new(3).unwrap()).unwrap(),
+        Some(&ui),
+    )
+    .await
+    .map_err(anyhow::Error::from)
+    .unwrap();
+}
+
+#[tokio::test]
+#[should_panic(expected = "sncast timed out while waiting for transaction to succeed")]
+async fn test_wait_for_nonexistent_tx() {
+    let provider = create_test_provider();
+    let ui = UI::default();
+    wait_for_tx(
+        &provider,
+        "0x123456789".parse().expect("Could not parse a number"),
+        ValidatedWaitParams::new(NonZeroU8::new(1).unwrap(), NonZeroU16::new(3).unwrap()).unwrap(),
+        Some(&ui),
+    )
+    .await
+    .map_err(anyhow::Error::from)
+    .unwrap();
+}
+
+#[tokio::test]
+async fn test_happy_path_handle_wait_for_tx() {
+    let provider = create_test_provider();
+    let ui = UI::default();
+    let res = handle_wait_for_tx(
+        &provider,
+        MAP_CONTRACT_DECLARE_TX_HASH_SEPOLIA.parse().unwrap(),
+        1,
+        WaitForTx {
+            wait: true,
+            wait_params: ValidatedWaitParams::new(
+                NonZeroU8::new(5).unwrap(),
+                NonZeroU16::new(63).unwrap(),
+            )
+            .unwrap(),
+            show_ui_outputs: true,
+        },
+        &ui,
+    )
+    .await;
+
+    assert!(matches!(res, Ok(1)));
+}
+
+#[tokio::test]
+async fn test_wait_for_wrong_retry_values() {
+    let err = ValidatedWaitParams::new(NonZeroU8::new(2).unwrap(), NonZeroU16::new(1).unwrap())
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "retry_interval cannot be greater than timeout"
+    );
+}
